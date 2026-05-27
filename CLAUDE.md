@@ -2,28 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status
-
-Planning phase — no code has been written yet. The planning docs in the root directory are the source of truth for all design decisions:
-
-- `planning/overview.md` — goals, key decisions (why explicit routing over smart routing, why registry-driven)
-- `planning/architecture.md` — full tool specs, registry JSON schema, server startup behavior, config.json format
-- `planning/maintenance.md` — CLI modes, benchmark test suite specs, scoring logic, `--apply` diff format
-- `planning/models.md` — current Ollama model inventory with capabilities and initial default rationale
-
-Read these before implementing. The decisions in `overview.md` are final unless explicitly revisited.
-
----
-
 ## Architecture at a Glance
 
 ```
-server.py        — MCP server (stdio). Reads registry.json at startup. Exposes tools.
-maintenance.py   — CLI for syncing, benchmarking, updating registry.json.
-registry.json    — Auto-maintained. Maps tools to models + benchmark scores. Written by maintenance.py.
-config.json      — User overrides. Never written by maintenance.py.
-benchmarks/      — Test suite modules (json_test.py, html_test.py, code_test.py, etc.)
-assets/          — Static test fixtures (bench_image.jpg for vision benchmark)
+server.py             — MCP server (stdio). Reads registry.json at startup. Exposes tools.
+maintenance.py        — CLI for syncing, benchmarking, updating registry.json.
+registry.json         — Auto-maintained. Maps tools to models + benchmark scores. Written by maintenance.py.
+registry.json.example — Schema template. Copy to registry.json to start fresh.
+config.json           — User overrides. Never written by maintenance.py. (gitignored)
+assets/               — Static test fixtures (bench_image.jpg for vision benchmark)
 ```
 
 ---
@@ -49,38 +36,57 @@ If a tool's default model is missing from Ollama, surface a clear error naming t
 
 ## Tools Exposed by the MCP Server
 
-| Tool | Default Model | Task |
-|------|--------------|------|
-| `local_chat` | qwen3.5:9b-q4_K_M | General reasoning, drafts, Q&A |
-| `local_code` | devstral-small-2:latest | Code generation, review, refactoring |
-| `local_vision` | qwen3-vl:8b | Image/screenshot analysis |
-| `local_ocr` | glm-ocr:latest | Document/scan text extraction |
-| `local_embed` | nomic-embed-text:latest | Embeddings for semantic search/RAG |
-| `list_local_models` | — | Introspection |
+| Tool | Task |
+|------|------|
+| `local_chat` | General reasoning, drafts, Q&A, summarization |
+| `local_code` | Code generation, review, refactoring |
+| `local_vision` | Image/screenshot/diagram analysis |
+| `local_ocr` | Document/scan text extraction |
+| `local_embed` | Embeddings for semantic search/RAG |
+| `list_local_models` | Introspection — list installed models and their registry status |
 
-All tools accept an optional `model` parameter to override the registry default.
+Defaults are computed by `maintenance.py --apply` based on benchmark scores. All tools accept an optional `model` parameter to override the registry default.
 
 ---
 
-## MCP Server Registration
+## Setup
 
-Add to `~/.claude/settings.json` to enable in Claude Code sessions:
+```bash
+# 1. Create virtualenv and install dependencies
+python3 -m venv .venv
+.venv/bin/pip install mcp ollama
 
-```json
-{
-  "mcpServers": {
-    "ollama-local": {
-      "command": "/path/to/ollama-mcp/.venv/bin/python",
-      "args": ["/path/to/ollama-mcp/server.py"],
-      "env": {
-        "OLLAMA_HOST": "http://localhost:11434"
-      }
-    }
-  }
-}
+# 2. Initialize registry
+cp registry.json.example registry.json
+
+# 3. Sync installed Ollama models and benchmark them
+.venv/bin/python maintenance.py --sync
+.venv/bin/python maintenance.py --bench --new
+.venv/bin/python maintenance.py --apply
+
+# 4. Register with Claude Code (user-scope = available in all projects)
+claude mcp add --scope user ollama-local \
+  -e OLLAMA_HOST=http://localhost:11434 \
+  -- /path/to/ollama-mcp/.venv/bin/python /path/to/ollama-mcp/server.py
 ```
 
 Transport is stdio — no persistent port, no daemon. Claude spawns it on demand.
+
+---
+
+## Optional: config.json overrides
+
+Create `config.json` to pin specific models regardless of benchmark scores:
+
+```json
+{
+  "tool_overrides": {
+    "local_chat":   "gemma4:e2b",
+    "local_code":   "gemma4:e2b-mlx",
+    "local_vision": "gemma4:e2b"
+  }
+}
+```
 
 ---
 
@@ -88,20 +94,20 @@ Transport is stdio — no persistent port, no daemon. Claude spawns it on demand
 
 ```bash
 # After pulling a new model
-python maintenance.py --sync
-python maintenance.py --bench --new
-python maintenance.py --report
-python maintenance.py --apply
+.venv/bin/python maintenance.py --sync
+.venv/bin/python maintenance.py --bench --new
+.venv/bin/python maintenance.py --report
+.venv/bin/python maintenance.py --apply
 
 # After removing a model
-python maintenance.py --sync       # removes it from registry
-python maintenance.py --apply      # recomputes defaults without it
+.venv/bin/python maintenance.py --sync       # removes it from registry
+.venv/bin/python maintenance.py --apply      # recomputes defaults without it
 
 # Re-bench a specific model
-python maintenance.py --reset <model> && python maintenance.py --bench <model>
+.venv/bin/python maintenance.py --reset <model> && .venv/bin/python maintenance.py --bench <model>
 
 # Quick health check (latency + JSON compliance only)
-python maintenance.py --bench --quick
+.venv/bin/python maintenance.py --bench --quick
 ```
 
 `--apply` prints a diff and asks for confirmation before writing. Always review it.
@@ -113,19 +119,19 @@ python maintenance.py --bench --quick
 - Python 3.11+
 - `mcp` — MCP SDK (stdio transport)
 - `ollama` — Ollama Python client
-- `registry.json` — plain JSON, human-readable, should be git-tracked
+- Requires Ollama running at `http://localhost:11434` (or set `OLLAMA_HOST`)
 
 ---
 
 ## Known Model Gotchas
 
-- **Qwen models fail HTML/JSON structured output** — confirmed in prior work. The `html_generation` and `json_compliance` benchmarks exist specifically to catch this. Do not assume Ollama's `tools` capability flag implies reliable structured output.
+- **Structured output is not guaranteed by capability flags** — some models advertise `tools` support but fail JSON/HTML output benchmarks. Always run `--bench` after pulling a new model.
 
-- **Image-gen models (`flux2-klein`, `z-image-turbo`) are excluded** from MCP tools. They are handled by the separate `ollama-images` Claude Code skill.
+- **Image-gen models are excluded** — models that only do image generation (no completion) are automatically skipped during sync.
 
-- **Large model eviction** — Ollama loads one model at a time by default. `local_code` (devstral, 15 GB) will evict whatever was previously loaded. Warn the user in the `--bench` flow if a large model is currently active (`GET /api/ps`).
+- **Large model eviction** — Ollama loads one model at a time by default. Routing multiple tools to the same model minimizes memory churn.
 
-- **`llama3.1:latest` is the known-good fallback** — if Qwen or Gemma models fail benchmark tests, Llama 3.1 is a reliable fallback for `local_chat` and `local_code`.
+- **MLX variants (Apple Silicon)** — MLX models are faster on M-series chips but are text-only (no vision). Use standard variants for `local_vision`.
 
 ---
 

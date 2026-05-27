@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "last_synced": null,
+  "tool_defaults": {
+    "local_chat": null,
+    "local_code": null,
+    "local_vision": null,
+    "local_ocr": null,
+    "local_embed": null
+  },
+  "models": {}
+}

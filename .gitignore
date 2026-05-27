@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 config.json
+registry.json
+planning/
 tuya-raw.json
 .DS_Store
