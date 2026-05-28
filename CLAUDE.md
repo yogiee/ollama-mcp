@@ -115,6 +115,7 @@ Create `config.json` to pin specific models regardless of benchmark scores:
 ---
 
 ## Stack
+python, mcp, ollama
 
 - Python 3.11+
 - `mcp` — MCP SDK (stdio transport)
