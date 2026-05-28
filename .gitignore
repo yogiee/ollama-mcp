@@ -7,3 +7,7 @@ registry.json
 planning/
 tuya-raw.json
 .DS_Store
+
+# Claude Code (per-machine, not for sharing)
+.claude/
+CLAUDE.md
