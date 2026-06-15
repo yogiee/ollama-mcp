@@ -16,6 +16,8 @@ from typing import Optional
 
 import ollama
 
+from manifest import write_manifest
+
 # ── Paths & constants ──────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 REGISTRY_PATH = BASE_DIR / "registry.json"
@@ -446,6 +448,11 @@ def cmd_apply(registry: dict, config: dict) -> None:
         else:
             old_scores[tool] = None
 
+    # Carry forward manually-managed defaults not computed here (e.g. local_image.*,
+    # which map image modes to image-gen models and are never benchmarked).
+    for tool, model in registry.get("tool_defaults", {}).items():
+        new_defaults.setdefault(tool, model)
+
     # config overrides always win
     for tool, model in config_overrides.items():
         new_defaults[tool] = model
@@ -465,6 +472,7 @@ def cmd_apply(registry: dict, config: dict) -> None:
         if name in models:
             models[name]["avoid_for"] = avoid
     save_registry(registry)
+    print(f"Manifest: {write_manifest(new_defaults, source=registry.get('defaults_source', 'manual'))}")
 
 
 def _print_apply_diff(
@@ -507,7 +515,7 @@ def cmd_sync(registry: dict, client: ollama.Client) -> None:
     except Exception as exc:
         sys.exit(f"ERROR: Ollama not reachable: {exc}")
 
-    ollama_models = {m.model: m for m in all_models if not _is_image_gen(m.model)}
+    ollama_models = {m.model: m for m in all_models}  # image-gen admitted to the 'image' lane
     registry.setdefault("models", {})
 
     registry_names = set(registry["models"].keys())
@@ -522,7 +530,9 @@ def cmd_sync(registry: dict, client: ollama.Client) -> None:
 
     for name in sorted(new):
         size_bytes = getattr(ollama_models[name], "size", 0) or 0
-        caps = _get_capabilities(client, name)
+        # Image-gen models report no usable chat/vision capabilities; tag them for the
+        # image lane (never benchmarked — local_image defaults are set manually).
+        caps = ["image"] if _is_image_gen(name) else _get_capabilities(client, name)
         registry["models"][name] = _model_skeleton(size_bytes, caps)
         print(f"  NEW      {name}  [{', '.join(caps)}]")
 
@@ -592,6 +602,85 @@ def cmd_reset(registry: dict, model: str) -> None:
     save_registry(registry)
 
 
+# ── Import BenchLLAMA rankings ─────────────────────────────────────────────────
+_BUS_RANKINGS = Path.home() / ".config" / "ollama-consumers" / "benchllama-rankings.json"
+
+# OllamaMCP tool → BenchLLAMA ranking list. vision/ocr/embed lists are purpose-ordered, so the
+# top installed model is the right pick. workers/coders are quality-ordered — the data-current
+# baseline is the top installed, while deliberate efficiency picks (trading rank for size/speed/
+# consistency, which is a human judgment the data can't settle) live as config overrides.
+# local_image.* are unmapped → manual, carried forward untouched.
+_TOOL_RANKING = {
+    "local_chat":   "workers",
+    "local_code":   "coders",
+    "local_vision": "vision",
+    "local_ocr":    "vision_fast_ocr",
+    "local_embed":  "embedding_long",
+}
+
+
+def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> None:
+    rankings_path = Path(path) if path else _BUS_RANKINGS
+    if not rankings_path.exists():
+        sys.exit(f"ERROR: BenchLLAMA rankings not found: {rankings_path}\n"
+                 "Run BenchLLAMA's export, or pass the path explicitly.")
+    data = json.loads(rankings_path.read_text())
+    rk = data.get("rankings", {})
+    by_model = {m["name"]: m for m in data.get("models", [])}
+    generated = (data.get("generated") or "")[:10]
+    source = f"benchllama@{generated}" if generated else "benchllama"
+
+    installed = set(registry.get("models", {}).keys())
+    overrides = config.get("tool_overrides", {})
+
+    new_defaults = dict(registry.get("tool_defaults", {}))  # preserves manual keys (local_image.*)
+    top_pick: dict[str, Optional[str]] = {}
+    for tool, lst in _TOOL_RANKING.items():
+        ranked = rk.get(lst, [])
+        pick = next((m for m in ranked if m in installed), None)
+        top_pick[tool] = pick
+        if pick:
+            new_defaults[tool] = pick
+        else:
+            print(f"WARNING: no installed model in rankings.{lst} for {tool}; "
+                  f"keeping {new_defaults.get(tool)!r}")  # never silently reroute (invariant #5)
+
+    # Deliberate efficiency overrides (config.json) always win — invariant #3.
+    for tool, model in overrides.items():
+        new_defaults[tool] = model
+
+    _print_import_diff(registry.get("tool_defaults", {}), new_defaults,
+                       top_pick, overrides, rk, by_model, source)
+
+    if input("\nWrite changes? [y/N] ").strip().lower() != "y":
+        print("Aborted.")
+        return
+    registry["tool_defaults"] = new_defaults
+    registry["defaults_source"] = source
+    save_registry(registry)
+    print(f"Manifest: {write_manifest(new_defaults, source=source)}")
+
+
+def _print_import_diff(old, new, top_pick, overrides, rk, by_model, source) -> None:
+    def stat(name: str) -> str:
+        m = by_model.get(name, {})
+        return f"{m.get('disk_gb', '?')}GB {m.get('tps', '?')}tps"
+
+    print(f"\ntool_defaults from {source}:")
+    for tool, lst in _TOOL_RANKING.items():
+        ranked = rk.get(lst, [])
+        eff = new.get(tool)
+        was = old.get(tool, "(none)")
+        rank = f"{lst} #{ranked.index(eff) + 1}" if eff in ranked else f"{lst} (off-list)"
+        override_note = ""
+        if overrides.get(tool) == eff and top_pick.get(tool) != eff:
+            override_note = f"  (config override; rankings-top {top_pick.get(tool)})"
+        change = "  (unchanged)" if was == eff else f"  ⟵ {was}"
+        print(f"  {tool:<13} {eff}  [{rank}, {stat(eff)}]{override_note}{change}")
+    for tool in sorted(t for t in new if t not in _TOOL_RANKING):
+        print(f"  {tool:<13} {new[tool]}  [manual]")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -605,6 +694,7 @@ def main() -> None:
             "  python maintenance.py --bench --quick\n"
             "  python maintenance.py --report\n"
             "  python maintenance.py --apply\n"
+            "  python maintenance.py --import-benchllama\n"
             "  python maintenance.py --reset qwen3.5:9b-q4_K_M --bench qwen3.5:9b-q4_K_M\n"
         ),
     )
@@ -620,11 +710,16 @@ def main() -> None:
                         help="Print registry status, scores, and warnings")
     parser.add_argument("--apply", action="store_true",
                         help="Recompute tool defaults from benchmarks (shows diff, asks confirmation)")
+    parser.add_argument("--import-benchllama", nargs="?", const="__bus__", metavar="PATH",
+                        dest="import_benchllama",
+                        help="Set tool defaults from BenchLLAMA's rankings.json "
+                             "(default: the shared ~/.config/ollama-consumers bus)")
     parser.add_argument("--reset", metavar="MODEL",
                         help="Clear all benchmark data for a model")
     args = parser.parse_args()
 
-    if not any([args.sync, args.bench is not None, args.report, args.apply, args.reset]):
+    if not any([args.sync, args.bench is not None, args.report, args.apply,
+                args.import_benchllama is not None, args.reset]):
         parser.print_help()
         sys.exit(0)
 
@@ -653,6 +748,11 @@ def main() -> None:
     if args.apply:
         registry = load_registry()
         cmd_apply(registry, config)
+
+    if args.import_benchllama is not None:
+        registry = load_registry()
+        path = None if args.import_benchllama == "__bus__" else args.import_benchllama
+        cmd_import_benchllama(registry, config, path)
 
 
 if __name__ == "__main__":
