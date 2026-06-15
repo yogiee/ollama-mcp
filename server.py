@@ -3,15 +3,19 @@
 ollama-local MCP server — exposes Ollama models as tools in Claude Code sessions.
 Tool-to-model mappings are read from registry.json at startup.
 """
+import base64
 import json
 import os
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import ollama
 from mcp.server.fastmcp import FastMCP
+
+from manifest import write_manifest
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -39,6 +43,13 @@ TOOL_DEFAULTS: dict[str, str] = {
 OLLAMA_HOST: str = _config.get(
     "ollama_host", os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 )
+
+# Publish effective assignments to the consumer manifest (file-only, Ollama-independent).
+# Lets BenchLLAMA's drop-report see what this consumer uses without a live session.
+try:
+    write_manifest(TOOL_DEFAULTS, source=_registry.get("defaults_source", "manual"))
+except Exception as _exc:
+    print(f"WARNING: could not write consumer manifest: {_exc}", file=sys.stderr)
 
 # ── Ollama client ──────────────────────────────────────────────────────────────
 _client = ollama.Client(host=OLLAMA_HOST)
@@ -79,6 +90,77 @@ def _load_image(image_path: str) -> bytes:
         with urllib.request.urlopen(image_path, timeout=30) as resp:
             return resp.read()
     return Path(image_path).read_bytes()
+
+
+# Image-gen modes → tool-default key. Claude picks the mode from the user's request
+# (routing stays Claude-side, preserving the no-smart-routing invariant); the server
+# only maps mode → model. "photo" → fast photorealism, "design" → text/UI/illustration.
+_IMAGE_MODES = ("photo", "design")
+_MLX_FIX = (
+    "MLX library path issue. Run:\n"
+    "  sudo ln -sf /opt/homebrew/lib/libmlxc.dylib /usr/local/lib/libmlxc.dylib\n"
+    "  sudo ln -sf /opt/homebrew/lib/libmlx.dylib  /usr/local/lib/libmlx.dylib\n"
+    "  brew services restart ollama"
+)
+
+
+def _image_output_dir(output_dir: Optional[str]) -> Path:
+    """Resolve the save dir: explicit override → the project (cwd) folder → ~/Pictures fallback.
+
+    The MCP server inherits Claude's working directory, so cwd is the project folder when
+    launched in one. Falls back to ~/Pictures/Generated_images when cwd is not a usable project
+    location (the home directory, filesystem root, or not writable).
+    """
+    if output_dir:
+        return Path(output_dir)
+    cwd = Path.cwd()
+    if cwd not in (Path.home(), Path("/")) and os.access(cwd, os.W_OK):
+        return cwd / "Generated_images"
+    return Path.home() / "Pictures" / "Generated_images"
+
+
+def _generate_image(
+    model: str, prompt: str, width: int, height: int,
+    steps: Optional[int], output_dir: Optional[str],
+) -> str:
+    """POST to Ollama /api/generate, decode the base64 image, save a PNG, return its path."""
+    payload: dict = {
+        "model": model, "prompt": prompt, "stream": False,
+        "width": width, "height": height,
+    }
+    if steps:
+        payload["steps"] = steps
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:  # first call loads the model
+        data = json.loads(resp.read())
+
+    if data.get("error"):
+        msg = data["error"]
+        if "libmlxc.dylib" in msg:
+            return f"Error from Ollama: {msg}\n\nFIX: {_MLX_FIX}"
+        return f"Error from Ollama: {msg}"
+
+    image_b64 = data.get("image") or data.get("response") or ""
+    if not image_b64:
+        return f"Error: no image data in response (keys: {list(data.keys())})"
+
+    out_dir = _image_output_dir(output_dir)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:  # chosen dir unwritable after all → guaranteed-writable fallback
+        out_dir = Path.home() / "Pictures" / "Generated_images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = model.split("/")[-1].replace(":", "-")
+    safe = "".join(c if c.isalnum() or c in " _-" else "" for c in prompt[:45]).strip().replace(" ", "_")
+    out_path = out_dir / f"{stamp}_{tag}_{safe}.png"
+    out_path.write_bytes(base64.b64decode(image_b64))
+    return str(out_path)
 
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
@@ -197,6 +279,35 @@ def local_embed(
         return resp.embeddings
     except Exception as exc:
         return [f"Error: {exc}"]
+
+
+@mcp.tool()
+def local_image(
+    prompt: str,
+    mode: str = "photo",
+    model: Optional[str] = None,
+    width: int = 1024,
+    height: int = 1024,
+    steps: Optional[int] = None,
+    output_dir: Optional[str] = None,
+) -> str:
+    """Generate an image locally from a text prompt. Returns the saved PNG file path.
+
+    mode="photo"  -> photorealism, portraits, landscapes, product shots (fast)
+    mode="design" -> text-in-image, logos, UI mockups, posters, illustration, editing
+    Pick mode from the user's request; pass model= to force a specific model.
+    macOS-only; 1024x1024 default; the first call loads the model (~60-120s).
+    Saves to ./Generated_images in the current project, else ~/Pictures/Generated_images.
+    """
+    if mode not in _IMAGE_MODES:
+        return f"Error: mode must be one of {_IMAGE_MODES}, got '{mode}'"
+    ok, result = _resolve_model(f"local_image.{mode}", model)
+    if not ok:
+        return f"Error: {result}"
+    try:
+        return _generate_image(result, prompt, width, height, steps, output_dir)
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 @mcp.tool()

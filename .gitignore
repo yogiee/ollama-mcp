@@ -6,6 +6,7 @@ config.json
 registry.json
 planning/
 tuya-raw.json
+Generated_images/
 .DS_Store
 
 # Claude Code (per-machine, not for sharing)
