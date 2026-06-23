@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ollama-local MCP server — exposes Ollama models as tools in Claude Code sessions.
+ollama-mcp MCP server — exposes Ollama models as tools in Claude Code sessions.
 Tool-to-model mappings are read from registry.json at startup.
 """
 import base64
@@ -169,7 +169,7 @@ def _generate_image(
 
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
-mcp = FastMCP("ollama-local")
+mcp = FastMCP("ollama-mcp")
 
 
 @mcp.tool()

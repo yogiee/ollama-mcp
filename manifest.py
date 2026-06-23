@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-CONSUMER = "ollama-local"
+CONSUMER = "ollama-mcp"
 SELECTION_POLICY = "efficiency-balanced"  # vs MemoryCentral's "requirements-fit"
 MANIFEST_DIR = Path.home() / ".config" / "ollama-consumers"
 MANIFEST_PATH = MANIFEST_DIR / f"{CONSUMER}.json"

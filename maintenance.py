@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maintenance.py — Sync, benchmark, and update registry.json for ollama-local MCP.
+maintenance.py — Sync, benchmark, and update registry.json for ollama-mcp MCP.
 Run manually after pulling or removing Ollama models.
 """
 import argparse
@@ -720,7 +720,7 @@ def _print_import_diff(old, new, top_pick, overrides, rk, by_model, source, fall
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Maintain ollama-local MCP registry",
+        description="Maintain ollama-mcp MCP registry",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
