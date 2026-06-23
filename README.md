@@ -1,10 +1,12 @@
 # ollama-mcp
 
-Run local Ollama models as tools inside [Claude Code](https://claude.ai/code). Offload drafts, code generation, vision tasks, and embeddings to your local GPU — no API calls, no data leaving your machine.
+Run local Ollama models as tools inside [Claude Code](https://claude.ai/code). Offload drafts, code generation, vision tasks, embeddings, and text-to-image generation to your local GPU — no API calls, no data leaving your machine.
 
 ```
-Claude Code  →  local_chat / local_code / local_vision  →  Ollama  →  your models
+Claude Code  →  local_chat / local_code / local_vision / local_image / …  →  Ollama  →  your models
 ```
+
+The MCP server registers under the name **`ollama-mcp`** (matching the repo/folder).
 
 ---
 
@@ -56,7 +58,7 @@ cp registry.json.example registry.json
 ### 4. Register with Claude Code
 
 ```bash
-claude mcp add --scope user ollama-local \
+claude mcp add --scope user ollama-mcp \
   -e OLLAMA_HOST=http://localhost:11434 \
   -- /path/to/ollama-mcp/.venv/bin/python /path/to/ollama-mcp/server.py
 ```
@@ -67,7 +69,7 @@ Verify the server connected:
 
 ```bash
 claude mcp list
-# ollama-local: ... ✓ Connected
+# ollama-mcp: ... ✓ Connected
 ```
 
 ---
@@ -83,9 +85,32 @@ Once registered, these tools are available in every Claude Code session:
 | `local_vision` | Image / screenshot / diagram analysis | `image_path` (file or URL), `prompt`, optional `model` |
 | `local_ocr` | Text extraction from documents or scans | `image_path` (file or URL), optional `model` |
 | `local_embed` | Embeddings for semantic search / RAG | `input` (string or list), optional `model` |
+| `local_image` | Text-to-image generation | `prompt`, optional `mode` (`"photo"`/`"design"`), `model`, `width`, `height`, `steps`, `output_dir` |
 | `list_local_models` | List installed models and registry status | — |
 
 All tools accept an optional `model` parameter to override the registry default for that call.
+
+`local_image` picks its model from `mode`: `"photo"` (photorealism — portraits, landscapes, product shots) or `"design"` (text-in-image, logos, UI mockups, posters). It is macOS-only and saves PNGs to `./Generated_images` in the current project (or `~/Pictures/Generated_images`). Unlike the other tools, it is never benchmarked — see [Model recommendations](#model-recommendations) below.
+
+---
+
+## Model recommendations
+
+These are the current defaults on this machine, computed by `maintenance.py` from benchmark scores (or, for `local_image`, set manually). They are written into `registry.json` under `tool_defaults` — yours will differ based on which models you have pulled.
+
+| Tool | Default model |
+|------|--------------|
+| `local_chat` | `gemma4:latest` |
+| `local_code` | `granite4.1:3b` |
+| `local_vision` | `qwen2.5vl:3b` |
+| `local_ocr` | `minicpm-v4.6:1b` |
+| `local_embed` | `embeddinggemma:300m` |
+| `local_image` (`mode="photo"`) | `x/z-image-turbo:latest` |
+| `local_image` (`mode="design"`) | `x/flux2-klein:9b` |
+
+The `local_image.*` defaults are flat keys in `tool_defaults`, set manually and preserved across `--apply` (text-to-image has no objective structural grade to benchmark). All other defaults are recomputed from benchmarks. Override any of them per call with `model=`, or pin them in `config.json`.
+
+> <sub>Defaults above are based on current testing and usage on an Apple M1 Max (10-core CPU / 32-core GPU) + 32 GB RAM system. Faster or larger machines may favor bigger models; constrained machines may need smaller ones. Re-run `--bench` + `--apply` on your own hardware to get fleet-appropriate picks.</sub>
 
 ---
 
@@ -143,6 +168,14 @@ The model with the highest composite score for each tool's required capabilities
 
 ---
 
+## Advanced: BenchLLAMA integration
+
+If you run **BenchLLAMA** (a shared local benchmark/ranking tool), `ollama-mcp` can source its tool defaults from BenchLLAMA's cross-consumer rankings instead of its own benchmarks, and it publishes a consumer manifest so BenchLLAMA's drop-report knows which models you actually use. This is entirely optional — skip it if you don't use BenchLLAMA.
+
+See **[docs/benchllama.md](docs/benchllama.md)**.
+
+---
+
 ## Troubleshooting
 
 **`Ollama not reachable`** — Ollama isn't running. Start it with `ollama serve`.
@@ -151,4 +184,4 @@ The model with the highest composite score for each tool's required capabilities
 
 **Tools not showing in Claude Code** — Make sure you used `--scope user` when registering. Restart Claude Code after adding a new MCP server.
 
-**Server not connecting** — Verify the path to `.venv/bin/python` and `server.py` are absolute and correct: `claude mcp get ollama-local`.
+**Server not connecting** — Verify the path to `.venv/bin/python` and `server.py` are absolute and correct: `claude mcp get ollama-mcp`.
