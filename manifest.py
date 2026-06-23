@@ -32,20 +32,50 @@ _CAPABILITY_MAP: dict[str, tuple[str, Optional[str]]] = {
 }
 
 
-def _assignment(tool: str, model: str) -> dict:
-    """Wrap a tool→model pick as a schema-2 assignment object."""
-    capability, basis = _CAPABILITY_MAP.get(tool, ("manual", None))
+def _assignment(base_tool: str, model: str, tier: str = "primary") -> dict:
+    """Wrap a tool→model pick as a schema-2 assignment object.
+
+    `base_tool` is the real tool key (drives capability/basis) even for fallback entries, whose
+    dict key carries a ``#fallbackN`` suffix — so a fallback inherits its primary's capability and
+    BenchLLAMA protects it per-capability rather than as a capability-less ``models_in_use`` entry.
+    """
+    capability, basis = _CAPABILITY_MAP.get(base_tool, ("manual", None))
     entry = {"model": model, "capability": capability}
     if basis:
         entry["basis"] = basis
-    entry["tier"] = "primary"
+    entry["tier"] = tier
     return entry
 
 
-def build_manifest(tool_defaults: dict, source: str = "manual") -> dict:
-    """Build the schema-2 manifest from a tool→model mapping (config overrides already merged in)."""
-    assignments = {tool: _assignment(tool, model) for tool, model in tool_defaults.items() if model}
-    models_in_use = sorted({model for model in tool_defaults.values() if model})
+def build_manifest(tool_defaults: dict, source: str = "manual",
+                   fallbacks: Optional[dict] = None) -> dict:
+    """Build the schema-2 manifest from a tool→model mapping (config overrides already merged in).
+
+    `fallbacks` maps a tool key → ordered list of fallback models (best-first) — the models this
+    consumer would re-pin to if the primary were dropped. Each becomes its own ``tier:"fallback"``
+    assignment (keyed ``<tool>#fallbackN``) sharing the primary's capability, and joins the flat
+    ``models_in_use`` protected set. BenchLLAMA's drop-report protects the union of primaries +
+    fallbacks per capability, so a model in our fallback chain is never drop-recommended out from
+    under us. Keep the chain short — listing the whole fleet would protect everything and make the
+    drop-report useless.
+    """
+    fallbacks = fallbacks or {}
+    assignments: dict[str, dict] = {}
+    protected: list[str] = []
+    for tool, model in tool_defaults.items():
+        if not model:
+            continue
+        assignments[tool] = _assignment(tool, model, "primary")
+        protected.append(model)
+        seen = {model}
+        rank = 0
+        for fb in fallbacks.get(tool, []):
+            if not fb or fb in seen:
+                continue
+            rank += 1
+            seen.add(fb)
+            assignments[f"{tool}#fallback{rank}"] = _assignment(tool, fb, "fallback")
+            protected.append(fb)
     return {
         "schema": 2,
         "consumer": CONSUMER,
@@ -53,12 +83,15 @@ def build_manifest(tool_defaults: dict, source: str = "manual") -> dict:
         "selection_policy": SELECTION_POLICY,
         "source": source,
         "assignments": assignments,
-        "models_in_use": models_in_use,
+        "models_in_use": sorted(set(protected)),  # flat protected set: primaries + fallbacks
     }
 
 
-def write_manifest(tool_defaults: dict, source: str = "manual") -> Path:
+def write_manifest(tool_defaults: dict, source: str = "manual",
+                   fallbacks: Optional[dict] = None) -> Path:
     """Write the manifest to the conventional path and return it."""
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(json.dumps(build_manifest(tool_defaults, source), indent=2) + "\n")
+    MANIFEST_PATH.write_text(
+        json.dumps(build_manifest(tool_defaults, source, fallbacks), indent=2) + "\n"
+    )
     return MANIFEST_PATH

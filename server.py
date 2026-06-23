@@ -45,9 +45,14 @@ OLLAMA_HOST: str = _config.get(
 )
 
 # Publish effective assignments to the consumer manifest (file-only, Ollama-independent).
-# Lets BenchLLAMA's drop-report see what this consumer uses without a live session.
+# Lets BenchLLAMA's drop-report see what this consumer uses — primaries AND fallback chains
+# (persisted to the registry by maintenance.py) — without a live session.
 try:
-    write_manifest(TOOL_DEFAULTS, source=_registry.get("defaults_source", "manual"))
+    write_manifest(
+        TOOL_DEFAULTS,
+        source=_registry.get("defaults_source", "manual"),
+        fallbacks=_registry.get("tool_fallbacks"),
+    )
 except Exception as _exc:
     print(f"WARNING: could not write consumer manifest: {_exc}", file=sys.stderr)
 

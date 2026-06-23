@@ -374,6 +374,7 @@ def cmd_apply(registry: dict, config: dict) -> None:
     new_avoid: dict[str, list[str]] = {n: list(e.get("avoid_for", [])) for n, e in models.items()}
     new_scores: dict[str, Optional[float]] = {}   # tool → winning score (for diff display)
     old_scores: dict[str, Optional[float]] = {}   # tool → current default's score
+    new_ranked: dict[str, list] = {}              # tool → eligible models best-first (for fallbacks)
 
     for tool, (req_cap, bench_names) in _TOOL_SPEC.items():
         eligible = [
@@ -388,6 +389,7 @@ def cmd_apply(registry: dict, config: dict) -> None:
         # Embedding tools: no scoring, just pick first eligible
         if not bench_names:
             new_defaults[tool] = config_overrides.get(tool, eligible[0])
+            new_ranked[tool] = list(eligible)  # unscored; registry order is the best signal we have
             continue
 
         # Latency values for normalization
@@ -426,11 +428,13 @@ def cmd_apply(registry: dict, config: dict) -> None:
         if not candidates:
             new_defaults[tool] = registry.get("tool_defaults", {}).get(tool)
             new_scores[tool] = None
+            new_ranked[tool] = []
         else:
             candidates.sort(key=lambda x: x[1], reverse=True)
             winner, score = candidates[0]
             new_defaults[tool] = winner
             new_scores[tool] = score
+            new_ranked[tool] = [name for name, _ in candidates]
 
         # Score for the current default (for diff display)
         current = registry.get("tool_defaults", {}).get(tool)
@@ -457,6 +461,13 @@ def cmd_apply(registry: dict, config: dict) -> None:
     for tool, model in config_overrides.items():
         new_defaults[tool] = model
 
+    # Fallback chains for the manifest (best-first alternatives minus the effective primary),
+    # so BenchLLAMA's drop-report protects models we'd re-pin to — see manifest.py.
+    new_fallbacks = {
+        tool: _fallback_chain(ranked, new_defaults.get(tool))
+        for tool, ranked in new_ranked.items()
+    }
+
     _print_apply_diff(
         registry.get("tool_defaults", {}), new_defaults,
         {n: e.get("avoid_for", []) for n, e in models.items()}, new_avoid,
@@ -468,11 +479,12 @@ def cmd_apply(registry: dict, config: dict) -> None:
         return
 
     registry["tool_defaults"] = new_defaults
+    registry["tool_fallbacks"] = new_fallbacks
     for name, avoid in new_avoid.items():
         if name in models:
             models[name]["avoid_for"] = avoid
     save_registry(registry)
-    print(f"Manifest: {write_manifest(new_defaults, source=registry.get('defaults_source', 'manual'))}")
+    print(f"Manifest: {write_manifest(new_defaults, source=registry.get('defaults_source', 'manual'), fallbacks=new_fallbacks)}")
 
 
 def _print_apply_diff(
@@ -618,6 +630,17 @@ _TOOL_RANKING = {
     "local_embed":  "embedding_long",
 }
 
+# How many fallback models to publish per tool in the consumer manifest. The fallback chain is the
+# models we'd re-pin to if the primary were dropped; BenchLLAMA protects primaries + fallbacks from
+# its drop-report. Keep it short — a long chain protects the whole fleet and defeats the report.
+FALLBACK_DEPTH = 2
+
+
+def _fallback_chain(ranked_installed: list, primary: Optional[str],
+                    depth: int = FALLBACK_DEPTH) -> list:
+    """Top-`depth` installed alternatives (best-first) for a tool, excluding the effective primary."""
+    return [m for m in ranked_installed if m != primary][:depth]
+
 
 def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> None:
     rankings_path = Path(path) if path else _BUS_RANKINGS
@@ -649,19 +672,29 @@ def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> 
     for tool, model in overrides.items():
         new_defaults[tool] = model
 
+    # Fallback chains for the manifest: top installed alternatives per tool, minus the effective
+    # primary. Published so BenchLLAMA's drop-report protects models we'd re-pin to (see manifest.py).
+    new_fallbacks: dict[str, list] = {}
+    for tool, lst in _TOOL_RANKING.items():
+        ranked_installed = [m for m in rk.get(lst, []) if m in installed]
+        new_fallbacks[tool] = _fallback_chain(ranked_installed, new_defaults.get(tool))
+
     _print_import_diff(registry.get("tool_defaults", {}), new_defaults,
-                       top_pick, overrides, rk, by_model, source)
+                       top_pick, overrides, rk, by_model, source, new_fallbacks)
 
     if input("\nWrite changes? [y/N] ").strip().lower() != "y":
         print("Aborted.")
         return
     registry["tool_defaults"] = new_defaults
+    registry["tool_fallbacks"] = new_fallbacks
     registry["defaults_source"] = source
     save_registry(registry)
-    print(f"Manifest: {write_manifest(new_defaults, source=source)}")
+    print(f"Manifest: {write_manifest(new_defaults, source=source, fallbacks=new_fallbacks)}")
 
 
-def _print_import_diff(old, new, top_pick, overrides, rk, by_model, source) -> None:
+def _print_import_diff(old, new, top_pick, overrides, rk, by_model, source, fallbacks=None) -> None:
+    fallbacks = fallbacks or {}
+
     def stat(name: str) -> str:
         m = by_model.get(name, {})
         return f"{m.get('disk_gb', '?')}GB {m.get('tps', '?')}tps"
@@ -677,6 +710,9 @@ def _print_import_diff(old, new, top_pick, overrides, rk, by_model, source) -> N
             override_note = f"  (config override; rankings-top {top_pick.get(tool)})"
         change = "  (unchanged)" if was == eff else f"  ⟵ {was}"
         print(f"  {tool:<13} {eff}  [{rank}, {stat(eff)}]{override_note}{change}")
+        fb = fallbacks.get(tool, [])
+        if fb:
+            print(f"  {'':<13} └ fallbacks: {', '.join(fb)}")
     for tool in sorted(t for t in new if t not in _TOOL_RANKING):
         print(f"  {tool:<13} {new[tool]}  [manual]")
 
