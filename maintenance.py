@@ -661,10 +661,14 @@ FALLBACK_DEPTH = 2
 # memory-evicting giant — e.g. a 3GB vision primary shouldn't re-pin to an 18GB model. Within the cap
 # we still take the best-ranked models, so quality is maximized inside the memory budget. Per-tool
 # overrides live in config.json under "fallback_max_gb" (a "_default" key sets the fleet-wide ceiling;
-# vision is capped tighter because tiny vision models already score near the top). Note: :cloud models
-# report size_gb 0.0, so this cap does NOT exclude them — cloud handling stays separate (see the cloud
-# policy), unchanged by this cap.
+# vision is capped tighter because tiny vision models already score near the top).
 DEFAULT_FALLBACK_MAX_GB = 8.0
+
+# Cloud policy (2026-08-23): :cloud models are excluded from fallback chains outright. Every local_*
+# tool exists to keep inference on this machine, so a chain that silently re-pins to a remote endpoint
+# defeats the tool's purpose. The disk cap can't express this — cloud models report no local size, so
+# they pass every ceiling. They stay in the rankings and remain usable as a deliberate config.json
+# override: routing off-machine should be an explicit human choice, never a silent failover.
 
 
 def _fallback_cap(config: dict, tool: str) -> float:
@@ -673,19 +677,25 @@ def _fallback_cap(config: dict, tool: str) -> float:
     return caps.get(tool, caps.get("_default", DEFAULT_FALLBACK_MAX_GB))
 
 
+def _is_cloud(model: str, by_model: Optional[dict] = None) -> bool:
+    """True if `model` runs off-machine — BenchLLAMA's `cloud` flag, with the `:cloud` tag as backstop."""
+    return bool(((by_model or {}).get(model) or {}).get("cloud")) or model.endswith(":cloud")
+
+
 def _fallback_chain(ranked_installed: list, primary: Optional[str],
                     sizes: Optional[dict] = None, max_gb: Optional[float] = None,
-                    depth: int = FALLBACK_DEPTH) -> list:
+                    depth: int = FALLBACK_DEPTH, by_model: Optional[dict] = None) -> list:
     """Top-`depth` installed alternatives (best-first) for a tool, excluding the effective primary.
 
     Capped at `max_gb` disk so a small primary never re-pins to a memory-evicting giant; within the cap
     the order stays quality-rank. `sizes` maps model name → disk GB (from the registry); a model with
-    unknown size (None) is treated as uncapped so we never silently drop it.
+    unknown size (None) is treated as uncapped so we never silently drop it. Cloud models are skipped
+    outright per the cloud policy above — `by_model` (rankings `models[]`) carries the flag.
     """
     sizes = sizes or {}
     out = []
     for m in ranked_installed:
-        if m == primary:
+        if m == primary or _is_cloud(m, by_model):
             continue
         s = sizes.get(m)
         if max_gb is not None and s is not None and s > max_gb:
@@ -734,7 +744,8 @@ def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> 
     for tool, lst in _TOOL_RANKING.items():
         ranked_installed = [m for m in rk.get(lst, []) if m in installed]
         new_fallbacks[tool] = _fallback_chain(ranked_installed, new_defaults.get(tool),
-                                              sizes, _fallback_cap(config, tool))
+                                              sizes, _fallback_cap(config, tool),
+                                              by_model=by_model)
 
     _print_import_diff(registry.get("tool_defaults", {}), new_defaults,
                        top_pick, overrides, rk, by_model, source, new_fallbacks)
