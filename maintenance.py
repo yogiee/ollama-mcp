@@ -124,10 +124,28 @@ def _get_loaded_models(client: ollama.Client) -> list[str]:
 
 
 # ── Benchmark tests ────────────────────────────────────────────────────────────
+def _response_latency_ms(resp, wall_ms: float) -> float:
+    """Latency in ms EXCLUDING the one-time model load.
+
+    Ollama reports server-side durations (nanoseconds) on each response.
+    `total_duration - load_duration` is prompt-eval + generation with the model
+    load removed, so a cold call — where load can be 95%+ of wall time — doesn't
+    inflate the figure. Falls back to wall-clock when the server omits timings.
+    """
+    total = getattr(resp, "total_duration", None)
+    if not total:
+        return wall_ms
+    load = getattr(resp, "load_duration", None) or 0
+    return max(0.0, (total - load) / 1e6)
+
+
 def _timed_chat(client: ollama.Client, model: str, messages: list, **kwargs) -> tuple[str, float]:
+    """Returns (content, latency_ms). Latency excludes model load time — see
+    _response_latency_ms."""
     t0 = time.monotonic()
     resp = client.chat(model=model, messages=messages, **kwargs)
-    return resp.message.content, (time.monotonic() - t0) * 1000
+    wall_ms = (time.monotonic() - t0) * 1000
+    return resp.message.content, _response_latency_ms(resp, wall_ms)
 
 
 def bench_json_compliance(client: ollama.Client, model: str) -> dict:
@@ -249,7 +267,7 @@ def bench_vision_basic(client: ollama.Client, model: str) -> dict:
                 "images": [img],
             }],
         )
-        ms = (time.monotonic() - t0) * 1000
+        ms = _response_latency_ms(resp, (time.monotonic() - t0) * 1000)
         score = 1.0 if "apple" in resp.message.content.lower() else 0.0
     except Exception as exc:
         print(f"  ERROR: {exc}")
@@ -258,6 +276,9 @@ def bench_vision_basic(client: ollama.Client, model: str) -> dict:
 
 
 def bench_latency_baseline(client: ollama.Client, model: str) -> dict:
+    """Median warm-inference latency. _timed_chat excludes model load time, so the
+    first (cold) call's load cost is not counted — this measures responsiveness once
+    the model is resident, which is how the MCP server actually uses it."""
     prompt = "Say the word 'ready' and nothing else."
     times = []
     for _ in range(3):
@@ -461,10 +482,11 @@ def cmd_apply(registry: dict, config: dict) -> None:
     for tool, model in config_overrides.items():
         new_defaults[tool] = model
 
-    # Fallback chains for the manifest (best-first alternatives minus the effective primary),
-    # so BenchLLAMA's drop-report protects models we'd re-pin to — see manifest.py.
+    # Fallback chains for the manifest (best-first alternatives minus the effective primary, capped to
+    # the tool's disk budget), so BenchLLAMA's drop-report protects models we'd re-pin to — see manifest.py.
+    sizes = {n: e.get("size_gb") for n, e in models.items()}
     new_fallbacks = {
-        tool: _fallback_chain(ranked, new_defaults.get(tool))
+        tool: _fallback_chain(ranked, new_defaults.get(tool), sizes, _fallback_cap(config, tool))
         for tool, ranked in new_ranked.items()
     }
 
@@ -635,11 +657,43 @@ _TOOL_RANKING = {
 # its drop-report. Keep it short — a long chain protects the whole fleet and defeats the report.
 FALLBACK_DEPTH = 2
 
+# Disk-size ceiling for fallbacks (GB). A deliberately small/efficient primary must not fall back to a
+# memory-evicting giant — e.g. a 3GB vision primary shouldn't re-pin to an 18GB model. Within the cap
+# we still take the best-ranked models, so quality is maximized inside the memory budget. Per-tool
+# overrides live in config.json under "fallback_max_gb" (a "_default" key sets the fleet-wide ceiling;
+# vision is capped tighter because tiny vision models already score near the top). Note: :cloud models
+# report size_gb 0.0, so this cap does NOT exclude them — cloud handling stays separate (see the cloud
+# policy), unchanged by this cap.
+DEFAULT_FALLBACK_MAX_GB = 8.0
+
+
+def _fallback_cap(config: dict, tool: str) -> float:
+    """Per-tool fallback disk ceiling (GB): config.json fallback_max_gb[tool] → [_default] → module default."""
+    caps = config.get("fallback_max_gb", {})
+    return caps.get(tool, caps.get("_default", DEFAULT_FALLBACK_MAX_GB))
+
 
 def _fallback_chain(ranked_installed: list, primary: Optional[str],
+                    sizes: Optional[dict] = None, max_gb: Optional[float] = None,
                     depth: int = FALLBACK_DEPTH) -> list:
-    """Top-`depth` installed alternatives (best-first) for a tool, excluding the effective primary."""
-    return [m for m in ranked_installed if m != primary][:depth]
+    """Top-`depth` installed alternatives (best-first) for a tool, excluding the effective primary.
+
+    Capped at `max_gb` disk so a small primary never re-pins to a memory-evicting giant; within the cap
+    the order stays quality-rank. `sizes` maps model name → disk GB (from the registry); a model with
+    unknown size (None) is treated as uncapped so we never silently drop it.
+    """
+    sizes = sizes or {}
+    out = []
+    for m in ranked_installed:
+        if m == primary:
+            continue
+        s = sizes.get(m)
+        if max_gb is not None and s is not None and s > max_gb:
+            continue
+        out.append(m)
+        if len(out) >= depth:
+            break
+    return out
 
 
 def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> None:
@@ -673,11 +727,14 @@ def cmd_import_benchllama(registry: dict, config: dict, path: Optional[str]) -> 
         new_defaults[tool] = model
 
     # Fallback chains for the manifest: top installed alternatives per tool, minus the effective
-    # primary. Published so BenchLLAMA's drop-report protects models we'd re-pin to (see manifest.py).
+    # primary, capped to the tool's disk budget so a small primary never re-pins to a giant.
+    # Published so BenchLLAMA's drop-report protects models we'd re-pin to (see manifest.py).
+    sizes = {n: e.get("size_gb") for n, e in registry.get("models", {}).items()}
     new_fallbacks: dict[str, list] = {}
     for tool, lst in _TOOL_RANKING.items():
         ranked_installed = [m for m in rk.get(lst, []) if m in installed]
-        new_fallbacks[tool] = _fallback_chain(ranked_installed, new_defaults.get(tool))
+        new_fallbacks[tool] = _fallback_chain(ranked_installed, new_defaults.get(tool),
+                                              sizes, _fallback_cap(config, tool))
 
     _print_import_diff(registry.get("tool_defaults", {}), new_defaults,
                        top_pick, overrides, rk, by_model, source, new_fallbacks)
