@@ -28,7 +28,7 @@ git clone https://github.com/yogiee/ollama-mcp.git
 cd ollama-mcp
 
 python3 -m venv .venv
-.venv/bin/pip install mcp ollama
+.venv/bin/pip install -r requirements.txt
 ```
 
 ### 2. Initialize the registry
