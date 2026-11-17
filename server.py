@@ -2,18 +2,23 @@
 """
 ollama-mcp MCP server — exposes Ollama models as tools in Claude Code sessions.
 Tool-to-model mappings are read from registry.json at startup.
+
+The core is cross-platform and Ollama-only. `local_image` comes from the optional Apple-native layer in
+native/ (Core AI, macOS 27+) and is registered only where that layer can run.
 """
-import base64
+import asyncio
 import json
 import os
+import secrets
 import sys
+import tempfile
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import ollama
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from manifest import write_manifest
 
@@ -59,6 +64,39 @@ except Exception as _exc:
 # ── Ollama client ──────────────────────────────────────────────────────────────
 _client = ollama.Client(host=OLLAMA_HOST)
 
+# ── Apple-native layer (optional) ──────────────────────────────────────────────
+# Imported lazily so the core never depends on it. Native model ids are backend-qualified
+# ("coreai/flux2-klein-4b") and resolved against bundles on disk instead of Ollama's model list.
+_native = None                       # the native.image_backend module, when it can run here
+_native_helper: Optional[Path] = None
+_native_models: dict = {}            # id → NativeModel
+_native_models_dir: Optional[Path] = None
+_native_unavailable = "Apple-native layer not loaded"
+_NATIVE_PREFIX = "coreai/"
+
+try:
+    from native import image_backend as _nb
+
+    _ok, _why = _nb.platform_supported()
+    _helper = _nb.helper_path(_config.get("native_image_helper"))
+    if not _ok:
+        _native_unavailable = _why
+    elif _helper is None:
+        _native_unavailable = (
+            f"{_nb.HELPER_NAME} isn't built. Run: swift build -c release --package-path native"
+        )
+    else:
+        _native, _native_helper = _nb, _helper
+        _native_models_dir = _nb.models_dir(_config.get("native_models_dir"))
+        _native_models = _nb.discover(_native_models_dir)
+except Exception as _exc:  # never let the optional layer break the core
+    _native_unavailable = f"Apple-native layer failed to load: {_exc}"
+
+
+def _is_native(model: str) -> bool:
+    return model.startswith(_NATIVE_PREFIX)
+
+
 # ── Startup: verify reachability + warn on missing defaults ───────────────────
 _available_models: list[str] = []
 _ollama_reachable = False
@@ -66,24 +104,45 @@ _ollama_reachable = False
 try:
     _available_models = [m.model for m in _client.list().models]
     _ollama_reachable = True
-    for _tool, _model in TOOL_DEFAULTS.items():
-        if _model and _model not in _available_models:
-            print(
-                f"WARNING: {_tool} default model '{_model}' not found in Ollama. "
-                "Run: python maintenance.py --sync",
-                file=sys.stderr,
-            )
 except Exception as exc:
     print(f"WARNING: Ollama not reachable at {OLLAMA_HOST}: {exc}", file=sys.stderr)
+
+for _tool, _model in TOOL_DEFAULTS.items():
+    if not _model:
+        continue
+    if _tool.startswith("local_image."):
+        if _native is None:
+            continue  # local_image isn't registered on this host; nothing to warn about
+        if _model not in _native_models:
+            print(
+                f"WARNING: {_tool} default model '{_model}' has no bundle in {_native_models_dir}",
+                file=sys.stderr,
+            )
+    elif _ollama_reachable and _model not in _available_models:
+        print(
+            f"WARNING: {_tool} default model '{_model}' not found in Ollama. "
+            "Run: python maintenance.py --sync",
+            file=sys.stderr,
+        )
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _resolve_model(tool: str, override: Optional[str]) -> tuple[bool, str]:
     """Return (ok, model_name) on success or (False, error_message) on failure."""
-    if not _ollama_reachable:
-        return False, f"Ollama not reachable at {OLLAMA_HOST}"
     m = override or TOOL_DEFAULTS.get(tool)
     if not m:
         return False, f"No model configured for {tool}. Run: python maintenance.py --sync"
+    if _is_native(m):
+        if _native is None:
+            return False, f"Model '{m}' needs the Apple-native layer: {_native_unavailable}"
+        if m not in _native_models:
+            have = ", ".join(sorted(_native_models)) or "none"
+            return False, (
+                f"Model '{m}' has no Core AI bundle in {_native_models_dir} (installed: {have}). "
+                "Set native_models_dir in config.json, or download the bundle there."
+            )
+        return True, m
+    if not _ollama_reachable:
+        return False, f"Ollama not reachable at {OLLAMA_HOST}"
     if m not in _available_models:
         return False, f"Model '{m}' not found in Ollama. Run: python maintenance.py --sync"
     return True, m
@@ -99,14 +158,8 @@ def _load_image(image_path: str) -> bytes:
 
 # Image-gen modes → tool-default key. Claude picks the mode from the user's request
 # (routing stays Claude-side, preserving the no-smart-routing invariant); the server
-# only maps mode → model. "photo" → fast photorealism, "design" → text/UI/illustration.
+# only maps mode → model. "photo" → photorealism, "design" → text/UI/illustration/edits.
 _IMAGE_MODES = ("photo", "design")
-_MLX_FIX = (
-    "MLX library path issue. Run:\n"
-    "  sudo ln -sf /opt/homebrew/lib/libmlxc.dylib /usr/local/lib/libmlxc.dylib\n"
-    "  sudo ln -sf /opt/homebrew/lib/libmlx.dylib  /usr/local/lib/libmlx.dylib\n"
-    "  brew services restart ollama"
-)
 
 
 def _image_output_dir(output_dir: Optional[str]) -> Path:
@@ -124,36 +177,8 @@ def _image_output_dir(output_dir: Optional[str]) -> Path:
     return Path.home() / "Pictures" / "Generated_images"
 
 
-def _generate_image(
-    model: str, prompt: str, width: int, height: int,
-    steps: Optional[int], output_dir: Optional[str],
-) -> str:
-    """POST to Ollama /api/generate, decode the base64 image, save a PNG, return its path."""
-    payload: dict = {
-        "model": model, "prompt": prompt, "stream": False,
-        "width": width, "height": height,
-    }
-    if steps:
-        payload["steps"] = steps
-    req = urllib.request.Request(
-        f"{OLLAMA_HOST}/api/generate",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=600) as resp:  # first call loads the model
-        data = json.loads(resp.read())
-
-    if data.get("error"):
-        msg = data["error"]
-        if "libmlxc.dylib" in msg:
-            return f"Error from Ollama: {msg}\n\nFIX: {_MLX_FIX}"
-        return f"Error from Ollama: {msg}"
-
-    image_b64 = data.get("image") or data.get("response") or ""
-    if not image_b64:
-        return f"Error: no image data in response (keys: {list(data.keys())})"
-
+def _image_output_path(model: str, prompt: str, output_dir: Optional[str]) -> Path:
+    """A fresh, descriptive PNG path in the resolved save dir (created if needed)."""
     out_dir = _image_output_dir(output_dir)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -163,9 +188,40 @@ def _generate_image(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = model.split("/")[-1].replace(":", "-")
     safe = "".join(c if c.isalnum() or c in " _-" else "" for c in prompt[:45]).strip().replace(" ", "_")
-    out_path = out_dir / f"{stamp}_{tag}_{safe}.png"
-    out_path.write_bytes(base64.b64decode(image_b64))
-    return str(out_path)
+    return out_dir / f"{stamp}_{tag}_{safe}.png"
+
+
+def _make_room_for_image(editing: bool) -> str:
+    """Free memory for an image if it won't fit beside what's loaded. Returns a note for the result, or "".
+
+    Unloads only OllamaMCP's own tool-default models (they reload on their next call). Models other
+    apps loaded are left alone and named in the note, so the caller can decide; a consumer that knows
+    its own models (Looking Glass's voice and chat) should free them before calling local_image.
+    """
+    need = _native.needed_gb(editing)
+    free = _native.available_ram_gb()
+    if free is None or free >= need or not _ollama_reachable:
+        return ""
+    try:
+        resident = [m.model for m in _client.ps().models]
+    except Exception:
+        return ""
+    ours = {m for t, m in TOOL_DEFAULTS.items() if m and not t.startswith("local_image.")}
+    unloaded = []
+    for name in resident:
+        if name in ours:
+            try:
+                _client.generate(model=name, keep_alive=0)  # empty request + keep_alive 0 = unload
+                unloaded.append(name)
+            except Exception:
+                pass
+    others = [m for m in resident if m not in unloaded]
+    parts = [f"Memory was short ({free:.1f} GB free, ~{need:.1f} GB needed)"]
+    if unloaded:
+        parts.append(f"unloaded {', '.join(unloaded)}")
+    if others:
+        parts.append(f"still loaded by other apps: {', '.join(others)} (may swap)")
+    return "; ".join(parts) + ". "
 
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
@@ -191,7 +247,9 @@ def local_chat(
         resp = _client.chat(
             model=result,
             messages=messages,
-            options={"think": True} if thinking else None,
+            # Top-level arg, passed explicitly: thinking models (gemma4) think by default,
+            # so think=False is what actually turns it off. Ollama ignores options["think"].
+            think=thinking,
         )
         return resp.message.content
     except Exception as exc:
@@ -286,58 +344,132 @@ def local_embed(
         return [f"Error: {exc}"]
 
 
-@mcp.tool()
-def local_image(
+_image_lock = asyncio.Lock()  # one image at a time: each needs ~7 GB
+
+
+async def local_image(
     prompt: str,
     mode: str = "photo",
-    model: Optional[str] = None,
-    width: int = 1024,
-    height: int = 1024,
+    edit_image: Optional[str] = None,
+    seed: Optional[int] = None,
     steps: Optional[int] = None,
+    model: Optional[str] = None,
     output_dir: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> str:
-    """Generate an image locally from a text prompt. Returns the saved PNG file path.
+    """Generate an image on-device from a text prompt, or edit an existing image. Returns where the PNG was saved.
 
-    mode="photo"  -> photorealism, portraits, landscapes, product shots (fast)
-    mode="design" -> text-in-image, logos, UI mockups, posters, illustration, editing
+    mode="photo"  -> photorealism, portraits, landscapes, product shots
+    mode="design" -> text-in-image, logos, UI mockups, posters, illustration
+    edit_image    -> path or http(s) URL of an image to change; the prompt describes the change
+                     ("make the sky stormy"). To chain edits, pass the previous result's path.
+    seed          -> repeat a result exactly (same prompt + seed + model); random if omitted
+    steps         -> diffusion steps; the model's own default is best (Klein: 4)
     Pick mode from the user's request; pass model= to force a specific model.
-    macOS-only; 1024x1024 default; the first call loads the model (~60-120s).
+    Output is 1024x1024. Takes ~20-60 s (the very first run on a machine also prepares the model).
     Saves to ./Generated_images in the current project, else ~/Pictures/Generated_images.
+    The reply ends with the saved path.
     """
     if mode not in _IMAGE_MODES:
         return f"Error: mode must be one of {_IMAGE_MODES}, got '{mode}'"
     ok, result = _resolve_model(f"local_image.{mode}", model)
     if not ok:
         return f"Error: {result}"
+    if not _is_native(result):
+        return f"Error: '{result}' isn't an image model this server can run (expected a {_NATIVE_PREFIX}… model)"
+    native_model = _native_models[result]
+
+    temp_input: Optional[Path] = None
+    edit_path: Optional[Path] = None
+    if edit_image:
+        try:
+            if edit_image.startswith(("http://", "https://")):
+                suffix = Path(edit_image.split("?")[0]).suffix or ".png"
+                fd, name = tempfile.mkstemp(suffix=suffix, prefix="ollamamcp-edit-")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(_load_image(edit_image))
+                temp_input = edit_path = Path(name)
+            else:
+                edit_path = Path(edit_image).expanduser()
+                if not edit_path.is_file():
+                    return f"Error: edit_image '{edit_image}' not found"
+        except Exception as exc:
+            return f"Error loading edit_image '{edit_image}': {exc}"
+
+    seed = seed if seed is not None else secrets.randbelow(2**31)
+
+    async def on_step(step: int, total: int) -> None:
+        if ctx is not None:
+            await ctx.report_progress(step, total, f"step {step}/{total}")
+
     try:
-        return _generate_image(result, prompt, width, height, steps, output_dir)
+        async with _image_lock:
+            note = await asyncio.to_thread(_make_room_for_image, edit_path is not None)
+            out_path = _image_output_path(result, prompt, output_dir)
+            done = await _native.generate(
+                _native_helper, native_model, prompt, out_path, seed,
+                steps=steps, edit_image=edit_path, on_step=on_step,
+            )
     except Exception as exc:
         return f"Error: {exc}"
+    finally:
+        if temp_input is not None:
+            temp_input.unlink(missing_ok=True)
+
+    verb = "Edited" if edit_path is not None else "Generated"
+    return (
+        f"Seed {seed}. {verb} in {float(done.get('seconds', 0)):.1f} s "
+        f"({done.get('width')}x{done.get('height')}, {result}). {note}"
+        f"Image saved to {done.get('path', out_path)}"
+    )
+
+
+# Registered only where the Apple-native layer can run (macOS 27+, helper built). Elsewhere the
+# server starts without it, rather than offering a tool that can only fail.
+if _native is not None:
+    mcp.tool()(local_image)
 
 
 @mcp.tool()
 def list_local_models() -> list[dict]:
-    """List all Ollama models with capabilities, registry status, and which tool each is the default for."""
-    if not _ollama_reachable:
-        return [{"error": f"Ollama not reachable at {OLLAMA_HOST}"}]
+    """List installed models (Ollama, plus on-device Core AI image models where available) with
+    capabilities, registry status, and which tool(s) each is the default for."""
     registry_models: dict = _registry.get("models", {})
-    default_for: dict[str, str] = {v: k for k, v in TOOL_DEFAULTS.items() if v}
+    default_for: dict[str, list[str]] = {}
+    for tool, model in TOOL_DEFAULTS.items():
+        if model:
+            default_for.setdefault(model, []).append(tool)
     result = []
-    for m in _client.list().models:
-        name = m.model
-        entry = registry_models.get(name, {})
-        benchmarked = any(
-            isinstance(v, dict) and v.get("score") is not None
-            for v in entry.get("benchmarks", {}).values()
-        )
+    if _ollama_reachable:
+        for m in _client.list().models:
+            name = m.model
+            entry = registry_models.get(name, {})
+            benchmarked = any(
+                isinstance(v, dict) and v.get("score") is not None
+                for v in entry.get("benchmarks", {}).values()
+            )
+            result.append({
+                "name": name,
+                "backend": "ollama",
+                "size_gb": entry.get("size_gb"),
+                "capabilities": entry.get("ollama_capabilities", []),
+                "in_registry": name in registry_models,
+                "benchmarked": benchmarked,
+                "tool_default_for": ", ".join(default_for.get(name, [])) or None,
+                "avoid_for": entry.get("avoid_for", []),
+            })
+    else:
+        result.append({"error": f"Ollama not reachable at {OLLAMA_HOST}"})
+    for nm in _native_models.values():
         result.append({
-            "name": name,
-            "size_gb": entry.get("size_gb"),
-            "capabilities": entry.get("ollama_capabilities", []),
-            "in_registry": name in registry_models,
-            "benchmarked": benchmarked,
-            "tool_default_for": default_for.get(name),
-            "avoid_for": entry.get("avoid_for", []),
+            "name": nm.id,
+            "backend": _native.BACKEND,
+            "size_gb": nm.size_gb,
+            "capabilities": ["image", "image_edit"] if nm.can_edit else ["image"],
+            "in_registry": nm.id in registry_models,
+            "benchmarked": False,  # image models are never benchmarked (no objective grade)
+            "tool_default_for": ", ".join(default_for.get(nm.id, [])) or None,
+            "avoid_for": [],
         })
     return result
 

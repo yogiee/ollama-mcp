@@ -24,7 +24,14 @@ REGISTRY_PATH = BASE_DIR / "registry.json"
 CONFIG_PATH = BASE_DIR / "config.json"
 BENCH_IMAGE = BASE_DIR / "assets" / "bench_image.jpg"
 
-_IMAGE_GEN_MODELS = {"x/flux2-klein:9b", "x/z-image-turbo:latest"}
+# Ollama capabilities this server's tools use. Models with none of them (decision models, speech
+# models, …) are still recorded by --sync, for visibility, but never benchmarked or picked as defaults.
+_TOOL_CAPABILITIES = {"completion", "vision", "embedding"}
+# Of those, the ones the benchmark suite can test (embedding models have no bench; local_embed is unscored).
+_BENCHABLE_CAPABILITIES = {"completion", "vision"}
+# Models with these answer through their own endpoints, never chat: decision models (/v1/systemone) also
+# report "vision" because they accept images, and speech models (/v1/audio/speech) only speak.
+_NON_CHAT_CAPABILITIES = {"decision", "speech"}
 _DEFAULT_THRESHOLD = 0.5
 
 _EMPTY_BENCHMARKS: dict = {
@@ -78,8 +85,35 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _is_image_gen(name: str) -> bool:
-    return name in _IMAGE_GEN_MODELS
+def _backend(entry: dict) -> str:
+    """Where a registry model runs: "ollama" (the default) or a native backend such as "coreai"."""
+    return entry.get("backend", "ollama")
+
+
+def _tool_capabilities(entry: dict) -> set[str]:
+    """The capabilities this server's tools can use from an Ollama model (none for decision/speech models)."""
+    if _backend(entry) != "ollama":
+        return set()
+    caps = set(entry.get("ollama_capabilities", []))
+    if caps & _NON_CHAT_CAPABILITIES:
+        return set()
+    return caps & _TOOL_CAPABILITIES
+
+
+def _is_benchable(entry: dict) -> bool:
+    return bool(_BENCHABLE_CAPABILITIES & _tool_capabilities(entry))
+
+
+def _lane_note(entry: dict) -> str:
+    """Why a model is outside the benchmark, for --report."""
+    if _backend(entry) != "ollama":
+        return f"{_backend(entry)} image model, never benched"
+    caps = set(entry.get("ollama_capabilities", []))
+    if "embedding" in _tool_capabilities(entry):
+        return "embedding, unscored"
+    if caps & _NON_CHAT_CAPABILITIES:
+        return f"{'/'.join(sorted(caps & _NON_CHAT_CAPABILITIES))} model, not used by any tool"
+    return "not used by any tool"
 
 
 def _is_benched(entry: dict) -> bool:
@@ -303,6 +337,9 @@ def _bench_one(registry: dict, client: ollama.Client, model: str, tests: list[st
         print(f"  {model}: not in registry — run --sync first")
         return
     entry = registry["models"][model]
+    if not _is_benchable(entry):
+        print(f"  {model}: skipped ({_lane_note(entry)})")
+        return
     caps = entry.get("ollama_capabilities", [])
     print(f"\n  {model}")
 
@@ -344,11 +381,14 @@ def cmd_bench(
     if target:
         models_to_bench = [target]
     else:
-        models_to_bench = sorted(registry.get("models", {}).keys())
+        models_to_bench = sorted(
+            n for n, e in registry.get("models", {}).items() if _is_benchable(e)
+        )
         if new_only:
             models_to_bench = [
                 m for m in models_to_bench
-                if not _is_benched(registry["models"][m]) and m not in loaded
+                if _is_benchable(registry["models"][m])
+                and not _is_benched(registry["models"][m]) and m not in loaded
             ]
 
     if not models_to_bench:
@@ -400,7 +440,7 @@ def cmd_apply(registry: dict, config: dict) -> None:
     for tool, (req_cap, bench_names) in _TOOL_SPEC.items():
         eligible = [
             n for n, e in models.items()
-            if req_cap in e.get("ollama_capabilities", [])
+            if req_cap in _tool_capabilities(e)
         ]
 
         if not eligible:
@@ -542,17 +582,18 @@ def _print_apply_diff(
 
 
 # ── Sync ───────────────────────────────────────────────────────────────────────
-def cmd_sync(registry: dict, client: ollama.Client) -> None:
+def cmd_sync(registry: dict, client: ollama.Client, config: dict) -> None:
     print("Syncing with Ollama...")
     try:
         all_models = client.list().models
     except Exception as exc:
         sys.exit(f"ERROR: Ollama not reachable: {exc}")
 
-    ollama_models = {m.model: m for m in all_models}  # image-gen admitted to the 'image' lane
+    ollama_models = {m.model: m for m in all_models}
     registry.setdefault("models", {})
 
-    registry_names = set(registry["models"].keys())
+    # Only Ollama entries are reconciled against Ollama; native entries are synced below.
+    registry_names = {n for n, e in registry["models"].items() if _backend(e) == "ollama"}
     ollama_names = set(ollama_models.keys())
 
     removed = registry_names - ollama_names
@@ -564,17 +605,60 @@ def cmd_sync(registry: dict, client: ollama.Client) -> None:
 
     for name in sorted(new):
         size_bytes = getattr(ollama_models[name], "size", 0) or 0
-        # Image-gen models report no usable chat/vision capabilities; tag them for the
-        # image lane (never benchmarked — local_image defaults are set manually).
-        caps = ["image"] if _is_image_gen(name) else _get_capabilities(client, name)
+        caps = _get_capabilities(client, name)
         registry["models"][name] = _model_skeleton(size_bytes, caps)
-        print(f"  NEW      {name}  [{', '.join(caps)}]")
+        note = "" if _tool_capabilities({"ollama_capabilities": caps}) else "  (no tool uses this model)"
+        print(f"  NEW      {name}  [{', '.join(caps)}]{note}")
 
-    if not removed and not new:
+    native_changed = _sync_native(registry, config)
+
+    if not removed and not new and not native_changed:
         print("  No changes.")
 
     registry["last_synced"] = _now()
     save_registry(registry)
+
+
+def _sync_native(registry: dict, config: dict) -> bool:
+    """Record on-device Core AI image bundles (backend "coreai") so --report and the registry see them.
+
+    Optional layer: skipped quietly where it can't run. The server itself resolves native models
+    from disk at startup, so a stale registry never blocks local_image.
+    """
+    try:
+        from native import image_backend as nb
+    except Exception:
+        return False
+    ok, why = nb.platform_supported()
+    if not ok:
+        return False
+    root = nb.models_dir(config.get("native_models_dir"))
+    found = nb.discover(root)
+    print(f"Syncing Core AI image models in {root}...")
+    if nb.helper_path(config.get("native_image_helper")) is None:
+        print(f"  NOTE     {nb.HELPER_NAME} isn't built: swift build -c release --package-path native")
+    changed = False
+    for name in sorted(n for n, e in registry["models"].items() if _backend(e) == nb.BACKEND):
+        if name not in found:
+            del registry["models"][name]
+            print(f"  REMOVED  {name}")
+            changed = True
+    for mid, m in found.items():
+        entry = {
+            "backend": nb.BACKEND,
+            "path": str(m.path),
+            "size_gb": m.size_gb,
+            "capabilities": ["image", "image_edit"] if m.can_edit else ["image"],
+            "family": m.family,
+            "benchmarks": {},
+            "avoid_for": [],
+            "notes": "never benchmarked (no objective text-to-image grade); defaults set by hand",
+        }
+        if registry["models"].get(mid) != entry:
+            print(f"  {'NEW     ' if mid not in registry['models'] else 'UPDATED '} {mid}  [{', '.join(entry['capabilities'])}]")
+            registry["models"][mid] = entry
+            changed = True
+    return changed
 
 
 # ── Report ─────────────────────────────────────────────────────────────────────
@@ -596,12 +680,18 @@ def cmd_report(registry: dict, config: dict) -> None:
 
     print("Models:")
     for name, entry in sorted(registry.get("models", {}).items()):
-        caps = ", ".join(entry.get("ollama_capabilities", []))
+        caps = ", ".join(entry.get("ollama_capabilities") or entry.get("capabilities", []))
         size = entry.get("size_gb") or "?"
         benched = _is_benched(entry)
         avoid = entry.get("avoid_for", [])
-        status = "benched  " if benched else "UNBENCHED"
-        print(f"  [{status}] {name}  ({size} GB, {caps})")
+        if benched:
+            status = "benched  "
+        elif _is_benchable(entry):
+            status = "UNBENCHED"
+        else:
+            status = "n/a      "
+        lane = "" if _is_benchable(entry) else f" — {_lane_note(entry)}"
+        print(f"  [{status}] {name}  ({size} GB, {caps}){lane}")
         if avoid:
             print(f"             avoid_for: {avoid}")
         if benched:
@@ -620,7 +710,8 @@ def cmd_report(registry: dict, config: dict) -> None:
                 print(f"             {test:<25} {' '.join(parts)}")
     print("=" * 64)
 
-    unbenched = [n for n, e in registry.get("models", {}).items() if not _is_benched(e)]
+    unbenched = [n for n, e in registry.get("models", {}).items()
+                 if _is_benchable(e) and not _is_benched(e)]
     if unbenched:
         print(f"\nUnbenched models ({len(unbenched)}): {', '.join(unbenched)}")
         print("  Run: python maintenance.py --bench --new")
@@ -838,7 +929,7 @@ def main() -> None:
 
     if args.sync:
         registry = load_registry()
-        cmd_sync(registry, client)
+        cmd_sync(registry, client, config)
 
     if args.bench is not None:
         registry = load_registry()

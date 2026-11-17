@@ -7,8 +7,13 @@ registry.json
 planning/
 tuya-raw.json
 Generated_images/
+temp/
 .DS_Store
 
 # Claude Code (per-machine, not for sharing)
 .claude/
 CLAUDE.md
+
+# Swift build output for the Apple-native layer
+native/.build/
+native/.swiftpm/
