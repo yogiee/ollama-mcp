@@ -23,17 +23,22 @@ from typing import Awaitable, Callable, Optional
 
 BACKEND = "coreai"
 HELPER_NAME = "ollamamcp-imagegen"
+TOOLS_NAME = "ollamamcp-imagetools"     # upscale + cutout: macOS's own models, no Core AI
 NATIVE_DIR = Path(__file__).parent
 DEFAULT_HELPER = NATIVE_DIR / ".build" / "release" / HELPER_NAME
+DEFAULT_TOOLS = NATIVE_DIR / ".build" / "release" / TOOLS_NAME
 DEFAULT_MODELS_DIR = Path.home() / "Library" / "Application Support" / "OllamaMCP" / "models" / BACKEND
 
-# Diffusion families the helper's FlowTransformerPipeline runs (CoreAIDiffusionPipeline DiffusionConfig raw
-# values). Anything else, e.g. a Z-Image port that needs Python + torch, is skipped at discovery.
-SUPPORTED_TYPES = {"flux2", "sana-sprint"}
+# Diffusion families the helper runs: "flux2" and "sana-sprint" through Apple's FlowTransformerPipeline
+# (CoreAIDiffusionPipeline DiffusionConfig raw values), "zimage" through our own sampler (Sources/ImageGen/ZImage.swift,
+# for the Z-Image-Turbo bundle Looking Glass exported). Anything else is skipped at discovery.
+SUPPORTED_TYPES = {"flux2", "sana-sprint", "zimage"}
 
-# Measured helper peaks on an M1 Max (Looking Glass, 2026-09-19 / 10-13, FLUX.2 [klein] 4B int4): a new image
-# 6.8 GB, an edit on the full reference grid 7.25 GB. Used for the memory headroom check, plus a margin.
-PEAK_GB = {"generate": 6.8, "edit": 7.3}
+# Helper peak memory per family on an M1 Max, used for the headroom check (plus a margin):
+#   flux2   FLUX.2 [klein] 4B int4 (Looking Glass, 2026-09-19 / 10-13): new image 6.8 GB, full-grid edit 7.25 GB
+#   zimage  Z-Image-Turbo int4 (2026-11-17, warm): 7.1 GB max RSS, 3.1 GB footprint (text encoder unloaded first)
+#   sana-sprint  not measured yet; the Core AI survey's ~6.3 GB until it is
+PEAK_GB = {"flux2": {"generate": 6.8, "edit": 7.3}, "zimage": {"generate": 7.1}, "sana-sprint": {"generate": 6.3}}
 MARGIN_GB = 1.5
 GENERATE_TIMEOUT_S = 600   # the first run under a new process name specializes the model (~20–120 s)
 
@@ -47,7 +52,7 @@ class NativeModel:
     id: str            # "coreai/flux2-klein-4b"
     name: str          # bundle's own name, "FLUX.2-klein-4B"
     path: Path
-    family: str        # "flux2" | "sana-sprint"
+    family: str        # "flux2" | "sana-sprint" | "zimage"
     can_edit: bool     # has a VAE encoder, so img2img (edits) works
     size_gb: float
 
@@ -73,6 +78,11 @@ def helper_path(configured: Optional[str] = None) -> Optional[Path]:
     """The built helper: config.json `native_image_helper`, else native/.build/release/."""
     p = Path(configured).expanduser() if configured else DEFAULT_HELPER
     return p if p.is_file() else None
+
+
+def tools_path() -> Optional[Path]:
+    """The built image-utilities helper (upscale, cutout), next to the generator."""
+    return DEFAULT_TOOLS if DEFAULT_TOOLS.is_file() else None
 
 
 def models_dir(configured: Optional[str] = None) -> Path:
@@ -136,8 +146,9 @@ def available_ram_gb() -> Optional[float]:
     return round(pages * page_size / 1e9, 1) if pages else None
 
 
-def needed_gb(editing: bool) -> float:
-    return PEAK_GB["edit" if editing else "generate"] + MARGIN_GB
+def needed_gb(model: NativeModel, editing: bool) -> float:
+    peaks = PEAK_GB.get(model.family, PEAK_GB["flux2"])
+    return peaks.get("edit" if editing else "generate", peaks["generate"]) + MARGIN_GB
 
 
 # ── Running the helper ────────────────────────────────────────────────────────
@@ -162,6 +173,26 @@ async def generate(
         # Full grid keeps chained edits crisp; half (the coreai-models README example) blurs and drifts.
         args += ["--input-image", str(edit_image), "--reference-grid", "full"]
     return await _run(args, expect="done", on_step=on_step, timeout=GENERATE_TIMEOUT_S)
+
+
+UPSCALE_MAX_SIDE = 1920   # VTSuperResolutionScaler's input limit (4× → 7680)
+UPSCALE_PEAK_GB = 4.3     # measured 2026-11-17, 1024² → 4096²
+
+
+async def upscale(tools: Path, image: Path, output: Path, sharpen: Optional[float] = None) -> dict:
+    """4× super-resolution (Apple's VTSuperResolutionScaler) plus a light sharpen. Returns the `done` event."""
+    args = [str(tools), "--upscale", str(image), "--output", str(output)]
+    if sharpen is not None:
+        args += ["--sharpen", str(sharpen)]
+    return await _run(args, expect="done", timeout=120)
+
+
+async def cutout(tools: Path, image: Path, output: Path, crop: bool = False) -> dict:
+    """Foreground subject(s) on transparency (Vision's foreground instance mask). Returns the `done` event."""
+    args = [str(tools), "--cutout", str(image), "--output", str(output)]
+    if crop:
+        args.append("--crop")
+    return await _run(args, expect="done", timeout=120)
 
 
 async def clear_cache(helper: Path, model: NativeModel) -> dict:
@@ -202,7 +233,7 @@ async def _run(args: list[str], expect: str, timeout: float,
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        raise NativeImageError(f"{HELPER_NAME} timed out after {int(timeout)} s")
+        raise NativeImageError(f"{Path(args[0]).name} timed out after {int(timeout)} s")
     except asyncio.CancelledError:
         proc.kill()
         await proc.wait()
@@ -213,7 +244,7 @@ async def _run(args: list[str], expect: str, timeout: float,
     if result is None:
         stderr = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
         raise NativeImageError(
-            f"{HELPER_NAME} exited ({proc.returncode}) without a result"
+            f"{Path(args[0]).name} exited ({proc.returncode}) without a result"
             + (f": {stderr[-500:]}" if stderr else "")
         )
     return result

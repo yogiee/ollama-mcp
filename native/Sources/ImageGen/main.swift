@@ -1,7 +1,8 @@
 // ollamamcp-imagegen — OllamaMCP's on-device image generator (macOS 27+).
 //
 // A small command-line helper the MCP server runs once per image. It runs a FLUX.2 [klein] or Sana Sprint bundle
-// through Apple's Core AI diffusion pipeline (github.com/apple/coreai-models, CoreAIDiffusionPipeline) and exits,
+// through Apple's Core AI diffusion pipeline (github.com/apple/coreai-models, CoreAIDiffusionPipeline), or a
+// Z-Image-Turbo bundle through our own sampler (ZImage.swift), and exits,
 // so the ~7 GB it needs is returned to the system the moment the image is written: nothing stays resident between
 // requests. Loading from Core AI's specialization cache is ~1 s once warm, so a process per image costs little.
 //
@@ -122,6 +123,7 @@ func savePNG(_ image: CGImage, to url: URL) throws {
 
 func run(_ o: Options) async throws {
     let bundleURL = URL(fileURLWithPath: o.model)
+    if ZImage.isZImageBundle(bundleURL) { return try await runZImage(o, bundle: bundleURL) }
     let diffusion = try DiffusionBundle(at: bundleURL).config
     guard diffusion.type == .flux2 || diffusion.type == .sanaSprint else {
         throw HelperError("\(bundleURL.lastPathComponent) isn't a FLUX.2 or Sana Sprint bundle")
@@ -154,6 +156,21 @@ func run(_ o: Options) async throws {
         return true
     }
     guard let image = result.images.first else { throw HelperError("the pipeline returned no image") }
+    let out = URL(fileURLWithPath: o.output)
+    try savePNG(image, to: out)
+    let seconds = (ContinuousClock.now - start).components
+    emit(["event": "done", "path": out.path, "width": image.width, "height": image.height,
+          "seconds": Double(seconds.seconds) + Double(seconds.attoseconds) / 1e18])
+}
+
+func runZImage(_ o: Options, bundle: URL) async throws {
+    if o.inputImage != nil { throw HelperError("Z-Image bundles can't edit images (no image encoder)") }
+    if o.half { throw HelperError("Z-Image bundles decode at full resolution only") }
+    emit(["event": "loading"])
+    let start = ContinuousClock.now
+    let image = try await ZImage.generate(bundle: bundle, prompt: o.prompt, seed: o.seed, steps: o.steps) { step, total in
+        emit(["event": "step", "step": step, "total": total])
+    }
     let out = URL(fileURLWithPath: o.output)
     try savePNG(image, to: out)
     let seconds = (ContinuousClock.now - start).components

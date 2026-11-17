@@ -10,6 +10,9 @@ let package = Package(
         // Apple's Core AI runtime utilities. Pinned: the FLUX.2 [klein] bundle in use was exported for this
         // revision's pipeline, and Apple changes the package without notice. Bump deliberately, then re-test.
         .package(url: "https://github.com/apple/coreai-models", revision: "be11f018217f087df49d59b60bbff9cb08230403"),
+        // Already a dependency of coreai-models (resolved to the same version); named here because the Z-Image
+        // sampler tokenizes prompts itself.
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
     ],
     targets: [
         // The MCP server runs this once per image (see native/image_backend.py).
@@ -17,8 +20,15 @@ let package = Package(
             name: "ollamamcp-imagegen",
             dependencies: [
                 .product(name: "CoreAIDiffusion", package: "coreai-models"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/ImageGen"
+        ),
+        // Upscale and cutout (local_upscale / local_cutout): macOS's own VideoToolbox super-resolution and Vision
+        // subject masks. No Core AI, so it builds fast and leaves the image generator's cache name alone.
+        .executableTarget(
+            name: "ollamamcp-imagetools",
+            path: "Sources/ImageTools"
         ),
     ]
 )

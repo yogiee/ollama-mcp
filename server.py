@@ -9,6 +9,7 @@ native/ (Core AI, macOS 27+) and is registered only where that layer can run.
 import asyncio
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -73,12 +74,16 @@ _native_models: dict = {}            # id → NativeModel
 _native_models_dir: Optional[Path] = None
 _native_unavailable = "Apple-native layer not loaded"
 _NATIVE_PREFIX = "coreai/"
+_imagetools = None                   # the same module, when ollamamcp-imagetools (upscale/cutout) is built
+_imagetools_path: Optional[Path] = None
 
 try:
     from native import image_backend as _nb
 
     _ok, _why = _nb.platform_supported()
     _helper = _nb.helper_path(_config.get("native_image_helper"))
+    if _ok and _nb.tools_path() is not None:
+        _imagetools, _imagetools_path = _nb, _nb.tools_path()
     if not _ok:
         _native_unavailable = _why
     elif _helper is None:
@@ -130,6 +135,8 @@ def _resolve_model(tool: str, override: Optional[str]) -> tuple[bool, str]:
     """Return (ok, model_name) on success or (False, error_message) on failure."""
     m = override or TOOL_DEFAULTS.get(tool)
     if not m:
+        if tool.startswith("local_image."):  # image defaults are set by hand, never computed
+            return False, f"No model set for {tool}. Add it to tool_defaults in registry.json (or config.json tool_overrides)."
         return False, f"No model configured for {tool}. Run: python maintenance.py --sync"
     if _is_native(m):
         if _native is None:
@@ -158,7 +165,9 @@ def _load_image(image_path: str) -> bytes:
 
 # Image-gen modes → tool-default key. Claude picks the mode from the user's request
 # (routing stays Claude-side, preserving the no-smart-routing invariant); the server
-# only maps mode → model. "photo" → photorealism, "design" → text/UI/illustration/edits.
+# only maps mode → model. "photo" → photorealism, "design" → text/UI/illustration.
+# Edits with no mode map to their own key, local_image.edit (a fixed mapping, not routing),
+# because the photo model (Z-Image) can't edit.
 _IMAGE_MODES = ("photo", "design")
 
 
@@ -191,15 +200,43 @@ def _image_output_path(model: str, prompt: str, output_dir: Optional[str]) -> Pa
     return out_dir / f"{stamp}_{tag}_{safe}.png"
 
 
-def _make_room_for_image(editing: bool) -> str:
+def _input_image_file(src: str) -> tuple[Path, bool]:
+    """A local file for an image given as a path or http(s) URL. Returns (path, is_temporary).
+    Raises ValueError with a caller-facing message."""
+    if src.startswith(("http://", "https://")):
+        suffix = Path(src.split("?")[0]).suffix or ".png"
+        fd, name = tempfile.mkstemp(suffix=suffix, prefix="ollamamcp-input-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(_load_image(src))
+        return Path(name), True
+    p = Path(src).expanduser()
+    if not p.is_file():
+        raise ValueError(f"'{src}' not found")
+    return p, False
+
+
+def _derived_output_path(src: str, suffix: str, output_dir: Optional[str]) -> Path:
+    """`<stamp>_<source name>_<suffix>.png` in the image save dir, for upscale/cutout results."""
+    out_dir = _image_output_dir(output_dir)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        out_dir = Path.home() / "Pictures" / "Generated_images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(src.split("?")[0]).stem
+    stem = re.sub(r"^\d{8}_\d{6}_", "", stem)[:60] or "image"   # don't stack timestamps on our own outputs
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return out_dir / f"{stamp}_{stem}_{suffix}.png"
+
+
+def _make_room_for_image(need: float) -> str:
     """Free memory for an image if it won't fit beside what's loaded. Returns a note for the result, or "".
 
     Unloads only OllamaMCP's own tool-default models (they reload on their next call). Models other
     apps loaded are left alone and named in the note, so the caller can decide; a consumer that knows
     its own models (Looking Glass's voice and chat) should free them before calling local_image.
     """
-    need = _native.needed_gb(editing)
-    free = _native.available_ram_gb()
+    free = (_native or _imagetools).available_ram_gb()
     if free is None or free >= need or not _ollama_reachable:
         return ""
     try:
@@ -349,7 +386,7 @@ _image_lock = asyncio.Lock()  # one image at a time: each needs ~7 GB
 
 async def local_image(
     prompt: str,
-    mode: str = "photo",
+    mode: Optional[str] = None,
     edit_image: Optional[str] = None,
     seed: Optional[int] = None,
     steps: Optional[int] = None,
@@ -359,42 +396,47 @@ async def local_image(
 ) -> str:
     """Generate an image on-device from a text prompt, or edit an existing image. Returns where the PNG was saved.
 
-    mode="photo"  -> photorealism, portraits, landscapes, product shots
+    mode="photo"  -> photorealism, portraits, landscapes, product shots (the default for new images)
     mode="design" -> text-in-image, logos, UI mockups, posters, illustration
     edit_image    -> path or http(s) URL of an image to change; the prompt describes the change
-                     ("make the sky stormy"). To chain edits, pass the previous result's path.
+                     ("make the sky stormy"). Leave mode out for edits: they use the edit model.
+                     The photo model can't edit. To chain edits, pass the previous result's path.
     seed          -> repeat a result exactly (same prompt + seed + model); random if omitted
-    steps         -> diffusion steps; the model's own default is best (Klein: 4)
+    steps         -> diffusion steps; the model's own default is best
     Pick mode from the user's request; pass model= to force a specific model.
-    Output is 1024x1024. Takes ~20-60 s (the very first run on a machine also prepares the model).
-    Saves to ./Generated_images in the current project, else ~/Pictures/Generated_images.
-    The reply ends with the saved path.
+    Output is 1024x1024. Takes ~25 s (design, edit ~50 s) to ~75 s (photo); the very first run of each model on a
+    machine also prepares it. Saves to ./Generated_images in the current project, else
+    ~/Pictures/Generated_images. The reply ends with the saved path.
     """
-    if mode not in _IMAGE_MODES:
+    if mode is not None and mode not in _IMAGE_MODES:
         return f"Error: mode must be one of {_IMAGE_MODES}, got '{mode}'"
-    ok, result = _resolve_model(f"local_image.{mode}", model)
+    if edit_image and mode is None:
+        key = "local_image.edit"
+    else:
+        key = f"local_image.{mode or 'photo'}"
+    ok, result = _resolve_model(key, model)
     if not ok:
         return f"Error: {result}"
     if not _is_native(result):
         return f"Error: '{result}' isn't an image model this server can run (expected a {_NATIVE_PREFIX}… model)"
     native_model = _native_models[result]
+    if edit_image and not native_model.can_edit:
+        if model:
+            return f"Error: {result} can't edit images. Leave model out to use the edit model."
+        editor = TOOL_DEFAULTS.get("local_image.edit")
+        return (
+            f"Error: {mode} mode ({result}) can't edit images. Leave mode out for edits"
+            + (f": they use {editor}." if editor else ".")
+        )
 
     temp_input: Optional[Path] = None
     edit_path: Optional[Path] = None
     if edit_image:
         try:
-            if edit_image.startswith(("http://", "https://")):
-                suffix = Path(edit_image.split("?")[0]).suffix or ".png"
-                fd, name = tempfile.mkstemp(suffix=suffix, prefix="ollamamcp-edit-")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(_load_image(edit_image))
-                temp_input = edit_path = Path(name)
-            else:
-                edit_path = Path(edit_image).expanduser()
-                if not edit_path.is_file():
-                    return f"Error: edit_image '{edit_image}' not found"
+            edit_path, is_temp = _input_image_file(edit_image)
+            temp_input = edit_path if is_temp else None
         except Exception as exc:
-            return f"Error loading edit_image '{edit_image}': {exc}"
+            return f"Error loading edit_image: {exc}"
 
     seed = seed if seed is not None else secrets.randbelow(2**31)
 
@@ -404,7 +446,8 @@ async def local_image(
 
     try:
         async with _image_lock:
-            note = await asyncio.to_thread(_make_room_for_image, edit_path is not None)
+            need = _native.needed_gb(native_model, edit_path is not None)
+            note = await asyncio.to_thread(_make_room_for_image, need)
             out_path = _image_output_path(result, prompt, output_dir)
             done = await _native.generate(
                 _native_helper, native_model, prompt, out_path, seed,
@@ -424,10 +467,80 @@ async def local_image(
     )
 
 
-# Registered only where the Apple-native layer can run (macOS 27+, helper built). Elsewhere the
-# server starts without it, rather than offering a tool that can only fail.
+async def local_upscale(
+    image_path: str,
+    sharpen: Optional[float] = None,
+    output_dir: Optional[str] = None,
+) -> str:
+    """Enlarge an image 4x on-device (Apple's super-resolution), e.g. a local_image result for print or a crop.
+
+    image_path -> file path or http(s) URL; up to 1920 px per side (1024x1024 -> 4096x4096)
+    sharpen    -> 0 = Apple's output as is, default 1.6, max 3.0 (a light luminance sharpen; the scaler is soft)
+    Takes ~2 s. Saves a PNG to ./Generated_images in the current project, else ~/Pictures/Generated_images.
+    The reply ends with the saved path.
+    """
+    if sharpen is not None and not 0 <= sharpen <= 3:
+        return "Error: sharpen must be between 0 and 3"
+    try:
+        src, is_temp = _input_image_file(image_path)
+    except Exception as exc:
+        return f"Error loading image_path: {exc}"
+    try:
+        async with _image_lock:
+            note = await asyncio.to_thread(_make_room_for_image, _imagetools.UPSCALE_PEAK_GB + _imagetools.MARGIN_GB)
+            out = _derived_output_path(image_path, "upscaled-4x", output_dir)
+            done = await _imagetools.upscale(_imagetools_path, src, out, sharpen)
+    except Exception as exc:
+        return f"Error: {exc}"
+    finally:
+        if is_temp:
+            src.unlink(missing_ok=True)
+    return (
+        f"Upscaled to {done.get('width')}x{done.get('height')} in {float(done.get('seconds', 0)):.1f} s. {note}"
+        f"Image saved to {done.get('path', out)}"
+    )
+
+
+async def local_cutout(
+    image_path: str,
+    crop: bool = False,
+    output_dir: Optional[str] = None,
+) -> str:
+    """Remove the background: lift the main subject(s) of an image onto transparency, on-device (Apple Vision,
+    the same model as "Copy Subject" in Photos). For product shots, stickers, compositing.
+
+    image_path -> file path or http(s) URL
+    crop       -> trim the result to the subject (default: keep the original canvas size)
+    Takes under a second. Saves a transparent PNG to ./Generated_images in the current project, else
+    ~/Pictures/Generated_images. The reply ends with the saved path.
+    """
+    try:
+        src, is_temp = _input_image_file(image_path)
+    except Exception as exc:
+        return f"Error loading image_path: {exc}"
+    try:
+        async with _image_lock:
+            out = _derived_output_path(image_path, "cutout", output_dir)
+            done = await _imagetools.cutout(_imagetools_path, src, out, crop)
+    except Exception as exc:
+        return f"Error: {exc}"
+    finally:
+        if is_temp:
+            src.unlink(missing_ok=True)
+    n = int(done.get("subjects", 1))
+    return (
+        f"Cut out {n} subject{'s' if n != 1 else ''} ({done.get('width')}x{done.get('height')}, transparent "
+        f"background) in {float(done.get('seconds', 0)):.1f} s. Image saved to {done.get('path', out)}"
+    )
+
+
+# Registered only where the Apple-native layer can run (macOS 27+, helpers built). Elsewhere the
+# server starts without them, rather than offering tools that can only fail.
 if _native is not None:
     mcp.tool()(local_image)
+if _imagetools is not None:
+    mcp.tool()(local_upscale)
+    mcp.tool()(local_cutout)
 
 
 @mcp.tool()

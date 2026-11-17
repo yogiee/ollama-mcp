@@ -8,7 +8,8 @@
     "local_ocr": null,
     "local_embed": null,
     "local_image.photo": null,
-    "local_image.design": null
+    "local_image.design": null,
+    "local_image.edit": null
   },
   "models": {}
 }
