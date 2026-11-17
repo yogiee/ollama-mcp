@@ -71,7 +71,7 @@ _client = ollama.Client(host=OLLAMA_HOST)
 _native = None                       # the native.image_backend module, when it can run here
 _native_helper: Optional[Path] = None
 _native_models: dict = {}            # id → NativeModel
-_native_models_dir: Optional[Path] = None
+_native_models_dirs: list[Path] = []
 _native_unavailable = "Apple-native layer not loaded"
 _NATIVE_PREFIX = "coreai/"
 _imagetools = None                   # the same module, when ollamamcp-imagetools (upscale/cutout) is built
@@ -92,8 +92,8 @@ try:
         )
     else:
         _native, _native_helper = _nb, _helper
-        _native_models_dir = _nb.models_dir(_config.get("native_models_dir"))
-        _native_models = _nb.discover(_native_models_dir)
+        _native_models_dirs = _nb.models_dirs(_config.get("native_models_dir"))
+        _native_models = _nb.discover(_native_models_dirs)
 except Exception as _exc:  # never let the optional layer break the core
     _native_unavailable = f"Apple-native layer failed to load: {_exc}"
 
@@ -120,7 +120,7 @@ for _tool, _model in TOOL_DEFAULTS.items():
             continue  # local_image isn't registered on this host; nothing to warn about
         if _model not in _native_models:
             print(
-                f"WARNING: {_tool} default model '{_model}' has no bundle in {_native_models_dir}",
+                f"WARNING: {_tool} default model '{_model}' has no bundle in {' or '.join(map(str, _native_models_dirs))}",
                 file=sys.stderr,
             )
     elif _ollama_reachable and _model not in _available_models:
@@ -144,8 +144,8 @@ def _resolve_model(tool: str, override: Optional[str]) -> tuple[bool, str]:
         if m not in _native_models:
             have = ", ".join(sorted(_native_models)) or "none"
             return False, (
-                f"Model '{m}' has no Core AI bundle in {_native_models_dir} (installed: {have}). "
-                "Set native_models_dir in config.json, or download the bundle there."
+                f"Model '{m}' has no Core AI bundle in {' or '.join(map(str, _native_models_dirs))} "
+                f"(installed: {have}). Put the bundle in one of those folders (config.json native_models_dir adds one)."
             )
         return True, m
     if not _ollama_reachable:

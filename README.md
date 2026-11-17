@@ -157,7 +157,7 @@ swift build -c release --package-path native
 .venv/bin/python maintenance.py --sync
 ```
 
-Bundles are discovered by their `metadata.json`; FLUX.2 and Sana Sprint bundles (Apple's recipes) and Z-Image-Turbo bundles in the `lookingglass.zimage.v1` format (a custom export, not yet public) are supported. Model ids look like `coreai/flux2-klein-4b`. Two optional `config.json` keys point elsewhere:
+Bundles are discovered by their `metadata.json`; FLUX.2 and Sana Sprint bundles (Apple's recipes) and Z-Image-Turbo bundles in the `lookingglass.zimage.v1` format (a custom export, not yet public) are supported. Model ids look like `coreai/flux2-klein-4b`. Bundles are found in `~/Library/Application Support/OllamaMCP/models/coreai/`, plus one extra folder if you set it. Two optional `config.json` keys:
 
 ```json
 {

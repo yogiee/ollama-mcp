@@ -5,8 +5,8 @@ and registers ``local_image`` only when ``platform_supported()`` and ``helper_pa
 on Linux, Windows or older macOS the server starts exactly as before, just without the tool. Keep everything
 Apple-specific inside ``native/`` so it can later move out in one piece into a separate Apple-native MCP.
 
-Models are Core AI diffusion bundles (a folder with ``metadata.json`` + ``*.aimodel``), discovered on disk under
-``native_models_dir``. Their ids are backend-qualified (``coreai/flux2-klein-4b``) so they can sit in
+Models are Core AI diffusion bundles (a folder with ``metadata.json`` + ``*.aimodel``), discovered on disk in
+OllamaMCP's own models folder plus, if set, config.json ``native_models_dir``. Their ids are backend-qualified (``coreai/flux2-klein-4b``) so they can sit in
 ``tool_defaults`` beside Ollama model names without colliding.
 """
 from __future__ import annotations
@@ -85,8 +85,13 @@ def tools_path() -> Optional[Path]:
     return DEFAULT_TOOLS if DEFAULT_TOOLS.is_file() else None
 
 
-def models_dir(configured: Optional[str] = None) -> Path:
-    return Path(configured).expanduser() if configured else DEFAULT_MODELS_DIR
+def models_dirs(configured: Optional[str] = None) -> list[Path]:
+    """Where bundles are looked for: config.json `native_models_dir` (if set) first, then OllamaMCP's own folder.
+    Both, so bundles can live in the long-term home while an older folder (Looking Glass's) is still in use."""
+    dirs = [Path(configured).expanduser()] if configured else []
+    if DEFAULT_MODELS_DIR not in dirs:
+        dirs.append(DEFAULT_MODELS_DIR)
+    return dirs
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────────
@@ -101,12 +106,11 @@ def _dir_size_gb(path: Path) -> float:
     return round(total / 1e9, 1)
 
 
-def discover(root: Path) -> dict[str, NativeModel]:
-    """Every runnable Core AI diffusion bundle directly under `root`, keyed by id."""
+def discover(roots: list[Path]) -> dict[str, NativeModel]:
+    """Every runnable Core AI diffusion bundle directly under any of `roots`, keyed by id (the first root wins)."""
     found: dict[str, NativeModel] = {}
-    if not root.is_dir():
-        return found
-    for bundle in sorted(p for p in root.iterdir() if p.is_dir()):
+    bundles = [p for root in roots if root.is_dir() for p in sorted(root.iterdir()) if p.is_dir()]
+    for bundle in bundles:
         meta_path = bundle / "metadata.json"
         try:
             meta = json.loads(meta_path.read_text())
@@ -125,7 +129,7 @@ def discover(root: Path) -> dict[str, NativeModel]:
             can_edit="vae_encoder" in assets,
             size_gb=_dir_size_gb(bundle),
         )
-        found[m.id] = m
+        found.setdefault(m.id, m)
     return found
 
 

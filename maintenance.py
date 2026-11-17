@@ -632,9 +632,9 @@ def _sync_native(registry: dict, config: dict) -> bool:
     ok, why = nb.platform_supported()
     if not ok:
         return False
-    root = nb.models_dir(config.get("native_models_dir"))
-    found = nb.discover(root)
-    print(f"Syncing Core AI image models in {root}...")
+    roots = nb.models_dirs(config.get("native_models_dir"))
+    found = nb.discover(roots)
+    print(f"Syncing Core AI image models in {', '.join(map(str, roots))}...")
     if nb.helper_path(config.get("native_image_helper")) is None:
         print(f"  NOTE     {nb.HELPER_NAME} isn't built: swift build -c release --package-path native")
     changed = False
