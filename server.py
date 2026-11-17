@@ -76,6 +76,7 @@ _native_unavailable = "Apple-native layer not loaded"
 _NATIVE_PREFIX = "coreai/"
 _imagetools = None                   # the same module, when ollamamcp-imagetools (upscale/cutout) is built
 _imagetools_path: Optional[Path] = None
+_videogen_path: Optional[Path] = None   # ollamamcp-videogen (local_video), when built
 
 try:
     from native import image_backend as _nb
@@ -84,6 +85,8 @@ try:
     _helper = _nb.helper_path(_config.get("native_image_helper"))
     if _ok and _nb.tools_path() is not None:
         _imagetools, _imagetools_path = _nb, _nb.tools_path()
+    if _ok:
+        _videogen_path = _nb.video_path()
     if not _ok:
         _native_unavailable = _why
     elif _helper is None:
@@ -115,9 +118,9 @@ except Exception as exc:
 for _tool, _model in TOOL_DEFAULTS.items():
     if not _model:
         continue
-    if _tool.startswith("local_image."):
+    if _is_native(_model):
         if _native is None:
-            continue  # local_image isn't registered on this host; nothing to warn about
+            continue  # native tools aren't registered on this host; nothing to warn about
         if _model not in _native_models:
             print(
                 f"WARNING: {_tool} default model '{_model}' has no bundle in {' or '.join(map(str, _native_models_dirs))}",
@@ -135,7 +138,7 @@ def _resolve_model(tool: str, override: Optional[str]) -> tuple[bool, str]:
     """Return (ok, model_name) on success or (False, error_message) on failure."""
     m = override or TOOL_DEFAULTS.get(tool)
     if not m:
-        if tool.startswith("local_image."):  # image defaults are set by hand, never computed
+        if tool.startswith("local_image.") or tool == "local_video":  # set by hand, never computed
             return False, f"No model set for {tool}. Add it to tool_defaults in registry.json (or config.json tool_overrides)."
         return False, f"No model configured for {tool}. Run: python maintenance.py --sync"
     if _is_native(m):
@@ -186,8 +189,8 @@ def _image_output_dir(output_dir: Optional[str]) -> Path:
     return Path.home() / "Pictures" / "Generated_images"
 
 
-def _image_output_path(model: str, prompt: str, output_dir: Optional[str]) -> Path:
-    """A fresh, descriptive PNG path in the resolved save dir (created if needed)."""
+def _image_output_path(model: str, prompt: str, output_dir: Optional[str], ext: str = "png") -> Path:
+    """A fresh, descriptive file path (PNG, or mp4 for video) in the resolved save dir (created if needed)."""
     out_dir = _image_output_dir(output_dir)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +200,7 @@ def _image_output_path(model: str, prompt: str, output_dir: Optional[str]) -> Pa
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = model.split("/")[-1].replace(":", "-")
     safe = "".join(c if c.isalnum() or c in " _-" else "" for c in prompt[:45]).strip().replace(" ", "_")
-    return out_dir / f"{stamp}_{tag}_{safe}.png"
+    return out_dir / f"{stamp}_{tag}_{safe}.{ext}"
 
 
 def _input_image_file(src: str) -> tuple[Path, bool]:
@@ -420,6 +423,8 @@ async def local_image(
     if not _is_native(result):
         return f"Error: '{result}' isn't an image model this server can run (expected a {_NATIVE_PREFIX}… model)"
     native_model = _native_models[result]
+    if native_model.media != "image":
+        return f"Error: {result} is a video model; use local_video"
     if edit_image and not native_model.can_edit:
         if model:
             return f"Error: {result} can't edit images. Leave model out to use the edit model."
@@ -534,6 +539,58 @@ async def local_cutout(
     )
 
 
+async def local_video(
+    prompt: str,
+    quality: str = "fast",
+    frames: Optional[int] = None,
+    seed: Optional[int] = None,
+    model: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    ctx: Optional[Context] = None,
+) -> str:
+    """EXPERIMENTAL: generate a short silent video clip on-device from a text prompt (Wan 2.1, 832x480, 16 fps).
+
+    quality -> "fast" (12 steps, 33 frames ~2 s of video; the default), "balanced" (30 steps, 81 frames ~5 s),
+               "best" (50 steps, 81 frames). Slow: minutes per clip; progress is reported per step.
+    frames  -> override the clip length: 17, 33, 49, 65 or 81 frames (16 fps)
+    seed    -> repeat a result exactly; random if omitted
+    Saves an mp4 to ./Generated_images in the current project, else ~/Pictures/Generated_images.
+    The reply ends with the saved path.
+    """
+    if quality not in _native.VIDEO_QUALITIES:
+        return f"Error: quality must be one of {_native.VIDEO_QUALITIES}, got '{quality}'"
+    if frames is not None and frames not in _native.VIDEO_FRAMES:
+        return f"Error: frames must be one of {_native.VIDEO_FRAMES}"
+    ok, result = _resolve_model("local_video", model)
+    if not ok:
+        return f"Error: {result}"
+    if not _is_native(result) or _native_models[result].media != "video":
+        return f"Error: '{result}' isn't a video model this server can run"
+    native_model = _native_models[result]
+    seed = seed if seed is not None else secrets.randbelow(2**31)
+
+    async def on_step(step: int, total: int) -> None:
+        if ctx is not None:
+            await ctx.report_progress(step, total, f"step {step}/{total}")
+
+    try:
+        async with _image_lock:
+            note = await asyncio.to_thread(_make_room_for_image, _native.VIDEO_PEAK_GB + _native.MARGIN_GB)
+            out_path = _image_output_path(result, prompt, output_dir, ext="mp4")
+            done = await _native.generate_video(
+                _videogen_path, native_model, prompt, out_path, seed,
+                quality=quality, frames=frames, on_step=on_step,
+            )
+    except Exception as exc:
+        return f"Error: {exc}"
+    secs = float(done.get("seconds", 0))
+    n, fps = int(done.get("frames", 0)), int(done.get("fps", 16)) or 16
+    return (
+        f"Seed {seed}. Generated {n} frames ({n / fps:.1f} s at {fps} fps, {done.get('width')}x{done.get('height')}, "
+        f"{result}) in {secs / 60:.1f} min. {note}Video saved to {done.get('path', out_path)}"
+    )
+
+
 # Registered only where the Apple-native layer can run (macOS 27+, helpers built). Elsewhere the
 # server starts without them, rather than offering tools that can only fail.
 if _native is not None:
@@ -541,6 +598,9 @@ if _native is not None:
 if _imagetools is not None:
     mcp.tool()(local_upscale)
     mcp.tool()(local_cutout)
+# Video also needs an installed video bundle: without one the tool could only fail.
+if _native is not None and _videogen_path is not None and any(m.media == "video" for m in _native_models.values()):
+    mcp.tool()(local_video)
 
 
 @mcp.tool()
@@ -578,7 +638,7 @@ def list_local_models() -> list[dict]:
             "name": nm.id,
             "backend": _native.BACKEND,
             "size_gb": nm.size_gb,
-            "capabilities": ["image", "image_edit"] if nm.can_edit else ["image"],
+            "capabilities": ["video"] if nm.media == "video" else (["image", "image_edit"] if nm.can_edit else ["image"]),
             "in_registry": nm.id in registry_models,
             "benchmarked": False,  # image models are never benchmarked (no objective grade)
             "tool_default_for": ", ".join(default_for.get(nm.id, [])) or None,

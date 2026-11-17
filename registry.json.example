@@ -9,7 +9,8 @@
     "local_embed": null,
     "local_image.photo": null,
     "local_image.design": null,
-    "local_image.edit": null
+    "local_image.edit": null,
+    "local_video": null
   },
   "models": {}
 }
