@@ -24,18 +24,15 @@ from typing import Awaitable, Callable, Optional
 BACKEND = "coreai"
 HELPER_NAME = "ollamamcp-imagegen"
 TOOLS_NAME = "ollamamcp-imagetools"     # upscale + cutout: macOS's own models, no Core AI
-VIDEO_NAME = "ollamamcp-videogen"       # EXPERIMENTAL text-to-video (Wan 2.1)
 NATIVE_DIR = Path(__file__).parent
 DEFAULT_HELPER = NATIVE_DIR / ".build" / "release" / HELPER_NAME
 DEFAULT_TOOLS = NATIVE_DIR / ".build" / "release" / TOOLS_NAME
-DEFAULT_VIDEO = NATIVE_DIR / ".build" / "release" / VIDEO_NAME
 DEFAULT_MODELS_DIR = Path.home() / "Library" / "Application Support" / "OllamaMCP" / "models" / BACKEND
 
 # Diffusion families the helper runs: "flux2" and "sana-sprint" through Apple's FlowTransformerPipeline
 # (CoreAIDiffusionPipeline DiffusionConfig raw values), "zimage" through our own sampler (Sources/ImageGen/ZImage.swift,
 # for the Z-Image-Turbo bundle Looking Glass exported). Anything else is skipped at discovery.
 SUPPORTED_TYPES = {"flux2", "sana-sprint", "zimage"}
-VIDEO_TYPES = {"wan"}      # kind "video-diffusion", run by ollamamcp-videogen through Apple's WanPipeline
 
 # Helper peak memory per family on an M1 Max, used for the headroom check (plus a margin):
 #   flux2   FLUX.2 [klein] 4B int4 (Looking Glass, 2026-09-19 / 10-13): new image 6.8 GB, full-grid edit 7.25 GB
@@ -58,7 +55,6 @@ class NativeModel:
     family: str        # "flux2" | "sana-sprint" | "zimage"
     can_edit: bool     # has a VAE encoder, so img2img (edits) works
     size_gb: float
-    media: str = "image"   # "image" | "video"
 
 
 # ── Availability ──────────────────────────────────────────────────────────────
@@ -87,11 +83,6 @@ def helper_path(configured: Optional[str] = None) -> Optional[Path]:
 def tools_path() -> Optional[Path]:
     """The built image-utilities helper (upscale, cutout), next to the generator."""
     return DEFAULT_TOOLS if DEFAULT_TOOLS.is_file() else None
-
-
-def video_path() -> Optional[Path]:
-    """The built text-to-video helper, next to the generator."""
-    return DEFAULT_VIDEO if DEFAULT_VIDEO.is_file() else None
 
 
 def models_dirs(configured: Optional[str] = None) -> list[Path]:
@@ -126,11 +117,7 @@ def discover(roots: list[Path]) -> dict[str, NativeModel]:
         except (OSError, ValueError):
             continue
         family = (meta.get("diffusion") or {}).get("type")
-        if meta.get("kind") == "diffusion" and family in SUPPORTED_TYPES:
-            media = "image"
-        elif meta.get("kind") == "video-diffusion" and family in VIDEO_TYPES:
-            media = "video"
-        else:
+        if meta.get("kind") != "diffusion" or family not in SUPPORTED_TYPES:
             continue
         assets = meta.get("assets") or {}
         name = meta.get("name") or bundle.name
@@ -141,7 +128,6 @@ def discover(roots: list[Path]) -> dict[str, NativeModel]:
             family=family,
             can_edit="vae_encoder" in assets,
             size_gb=_dir_size_gb(bundle),
-            media=media,
         )
         found.setdefault(m.id, m)
     return found
@@ -211,25 +197,6 @@ async def cutout(tools: Path, image: Path, output: Path, crop: bool = False) -> 
     if crop:
         args.append("--crop")
     return await _run(args, expect="done", timeout=120)
-
-
-VIDEO_TIMEOUT_S = 3600    # a 5 s clip at "best" is many minutes on an M1 Max
-VIDEO_QUALITIES = ("fast", "balanced", "best")
-VIDEO_FRAMES = (17, 33, 49, 65, 81)
-VIDEO_PEAK_GB = 8.0       # placeholder until measured
-
-
-async def generate_video(helper: Path, model: NativeModel, prompt: str, output: Path, seed: int,
-                         quality: str = "fast", frames: Optional[int] = None, steps: Optional[int] = None,
-                         on_step: Optional[Callable[[int, int], Awaitable[None]]] = None) -> dict:
-    """One Wan clip → mp4. Returns the helper's `done` event: path, seconds, frames, fps, width, height."""
-    args = [str(helper), "--model", str(model.path), "--prompt", prompt, "--seed", str(seed),
-            "--output", str(output), "--quality", quality]
-    if frames:
-        args += ["--frames", str(frames)]
-    if steps:
-        args += ["--steps", str(steps)]
-    return await _run(args, expect="done", on_step=on_step, timeout=VIDEO_TIMEOUT_S)
 
 
 async def clear_cache(helper: Path, model: NativeModel) -> dict:

@@ -648,7 +648,7 @@ def _sync_native(registry: dict, config: dict) -> bool:
             "backend": nb.BACKEND,
             "path": str(m.path),
             "size_gb": m.size_gb,
-            "capabilities": ["video"] if m.media == "video" else (["image", "image_edit"] if m.can_edit else ["image"]),
+            "capabilities": ["image", "image_edit"] if m.can_edit else ["image"],
             "family": m.family,
             "benchmarks": {},
             "avoid_for": [],

@@ -24,15 +24,6 @@ let package = Package(
             ],
             path: "Sources/ImageGen"
         ),
-        // EXPERIMENTAL text-to-video (local_video): Wan 2.1 through Apple's WanPipeline. Its own executable, so
-        // the image helper stays lean and video keeps a separate Core AI cache.
-        .executableTarget(
-            name: "ollamamcp-videogen",
-            dependencies: [
-                .product(name: "CoreAIVideoDiffusion", package: "coreai-models"),
-            ],
-            path: "Sources/VideoGen"
-        ),
         // Upscale and cutout (local_upscale / local_cutout): macOS's own VideoToolbox super-resolution and Vision
         // subject masks. No Core AI, so it builds fast and leaves the image generator's cache name alone.
         .executableTarget(
